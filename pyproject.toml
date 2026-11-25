@@ -1,0 +1,30 @@
+[project]
+name = "conformal-calorie-estimation"
+version = "0.1.0"
+description = "Calorie estimation from food photos with conformal prediction intervals (Nutrition5k)"
+readme = "README.md"
+authors = [
+    { email = "davidgondur@proton.me" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mapie>=1.6.0",
+    "onnx>=1.23.2",
+    "onnxruntime>=1.32.0",
+    "timm>=1.0.31",
+    "torch>=2.15.0",
+]
+
+[project.scripts]
+conformal-calorie-estimation = "conformal_calorie_estimation:main"
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "marimo>=0.26.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]

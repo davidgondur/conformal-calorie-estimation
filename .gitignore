@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+__marimo__/
+
+# Data and model artifacts (too large for git)
+data/
+*.onnx
+*.pt
+*.pth
+*.ckpt
