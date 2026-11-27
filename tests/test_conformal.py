@@ -11,9 +11,13 @@ from conformal_calorie_estimation.conformal import (
     coverage,
     coverage_by_group,
     coverage_distribution,
+    cqr_interval,
+    interval_score,
     log_scale_interval,
+    normalized_interval,
     quantile_groups,
     resampled_coverage,
+    resampled_coverage_of,
 )
 
 
@@ -97,3 +101,47 @@ def test_resampled_coverage_keeps_groups_together():
     # Calibration of ~23 points must take whole groups: 25 points, so 75 in test.
     covs = resampled_coverage(y, np.log1p(y), 0.1, n_cal=23, n_reps=5, groups=groups)
     assert all(np.isfinite(c).all() for c in covs.values())
+
+
+def test_interval_score_by_hand():
+    y = np.array([5.0, 12.0, 0.0])
+    lo, hi = np.array([0.0, 0.0, 2.0]), np.array([10.0, 10.0, 10.0])
+    # widths 10, 10, 8; misses: 2 above, 2 below -> 2 / 0.5 * 2 = 8 each
+    assert interval_score(y, lo, hi, alpha=0.5) == pytest.approx((10 + 18 + 16) / 3)
+
+
+def _heteroscedastic(rng, n):
+    x = rng.uniform(0, 1, n)
+    noise_sd = 0.05 + 0.5 * x  # harder on the right
+    y_log = 5 + x + rng.normal(0, noise_sd)
+    return x, np.expm1(y_log), noise_sd
+
+
+def test_normalized_and_cqr_keep_coverage_and_adapt():
+    rng = np.random.default_rng(0)
+    alpha, covs = 0.1, {"normalized": [], "cqr": []}
+    widths_easy, widths_hard = [], []
+    z = 1.645  # true 5% / 95% quantiles of a normal
+    for _ in range(100):
+        x, y, sd = _heteroscedastic(rng, 1000)
+        pred = 5 + x  # a fixed model with the right mean
+        cal, test = slice(0, 500), slice(500, None)
+        lo, hi = normalized_interval(y[cal], pred[cal], sd[cal], pred[test], sd[test], alpha)
+        covs["normalized"].append(coverage(y[test], lo, hi))
+        qlo, qhi = pred - z * sd, pred + z * sd
+        clo, chi = cqr_interval(y[cal], qlo[cal], qhi[cal], qlo[test], qhi[test], alpha)
+        covs["cqr"].append(coverage(y[test], clo, chi))
+        width = np.log1p(hi) - np.log1p(lo)
+        widths_easy.append(width[x[test] < 0.2].mean())
+        widths_hard.append(width[x[test] > 0.8].mean())
+    for c in covs.values():
+        assert np.mean(c) >= 1 - alpha - 0.01
+    assert np.mean(widths_hard) > 3 * np.mean(widths_easy)
+
+
+def test_resampled_coverage_of_accepts_any_variants():
+    y = np.arange(1, 201, dtype=float)
+    out = resampled_coverage_of(
+        y, lambda cal: {"all": (np.zeros((~cal).sum()), np.full((~cal).sum(), 1e9))}, n_cal=50, n_reps=3
+    )
+    assert out["all"].tolist() == [1.0, 1.0, 1.0]

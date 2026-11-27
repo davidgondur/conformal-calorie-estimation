@@ -43,6 +43,11 @@ All numbers come from `docs/figures/metrics.json`, which `uv run python docs/mak
     [D12], [Multiplicative (log-scale) conformal intervals], [@sec:conformal],
     [D13], [marimo, Polars and Altair for analysis], [@sec:tooling],
     [D14], [Typst documents with generated numbers], [@sec:tooling],
+    [D15], [Adaptive intervals on the log scale only], [@sec:adaptive],
+    [D16], [Grouped cross-fitting for honest training residuals], [@sec:adaptive],
+    [D17], [Ridge difficulty model with a floor], [@sec:adaptive],
+    [D18], [Linear CQR with one shared correction], [@sec:adaptive],
+    [D19], [Interval score and coverage by group to compare variants], [@sec:adaptive],
   ),
   caption: [Summary of decisions.],
 )
@@ -237,13 +242,89 @@ All numbers come from `docs/figures/metrics.json`, which `uv run python docs/mak
       caption: [Coverage and mean width (kcal) per quartile of true calories in test, $alpha = #num(m.alpha)$ (target 90%).],
     )
   ],
-  consequences: [Very small and very large dishes are still below target (#pct(size-row(MUL, 0).coverage, d: 0) and #pct(size-row(MUL, 3).coverage, d: 0)). Normalized conformal and conformalized quantile regression @romano2019conformalized are the next step to adapt the width to the difficulty of each dish, not only to its size.],
+  consequences: [Very small and very large dishes are still below target (#pct(size-row(MUL, 0).coverage, d: 0) and #pct(size-row(MUL, 3).coverage, d: 0)). Normalized conformal and conformalized quantile regression @romano2019conformalized adapt the width to the difficulty of each dish, not only to its size (@sec:adaptive).],
 )
 
 #figure(
   image("figures/coverage_by_size.svg", width: 100%),
   caption: [Coverage and mean interval width per quartile of true calories in test. The horizontal line marks the 90% target.],
 ) <fig:size>
+
+= Adaptive intervals <sec:adaptive>
+
+#let ad = m.adaptive
+#let av(v) = ad.variants.at(v)
+#let NORM = "normalized (log)"
+#let CQRL = "CQR (log)"
+
+The baseline intervals widen only with the *size* of the predicted dish. Two variants that widen with the *difficulty* of each dish were added on the same frozen DINOv2 embeddings: normalized conformal and conformalized quantile regression (CQR). All four variants are calibrated on `calib`, and the new models read only `train` and `val`. The analysis is in `notebooks/adaptive.py`.
+
+#figure(
+  table(
+    columns: (1fr, auto, auto, auto, auto, auto),
+    align: (left, right, right, right, right, right),
+    table.header[Variant][Coverage][Mean width][Median width][Interval score][Coverage gap],
+    ..(ADD, MUL, NORM, CQRL).map(v => (
+      v, pct(av(v).coverage), num(av(v).width_mean, d: 0), num(av(v).width_median, d: 0),
+      num(av(v).interval_score, d: 0), pct(ad.spread_predicted.at(v).gap, d: 0),
+    )).flatten(),
+  ),
+  caption: [The four variants on test, $alpha = #num(m.alpha)$ (target 90%). Widths in kcal. The interval score is lower for better intervals. The coverage gap is the difference between the best and the worst quartile of predicted kcal.],
+) <tab:adaptive>
+
+#decision("D15", [Adaptive intervals on the log scale only],
+  chosen: [Build normalized conformal and CQR on the $log(1 + "kcal")$ scale, like the multiplicative baseline.],
+  alternatives: [Building them on both scales (kcal and log), which would give six variants.],
+  why: [The log scale already beat the kcal scale in the baseline (D12). Keeping one scale makes the comparison about one thing only: how the width adapts to each dish. It also keeps every interval non-negative without clipping.],
+)
+
+#decision("D16", [Grouped cross-fitting for honest training residuals],
+  chosen: [Obtain the residuals that train the difficulty model by 5-fold cross-fitting inside `train`. The folds keep incremental groups together, and each dish is predicted by a ridge that never saw it.],
+  alternatives: [Residuals on `val` (only #m.n.val dishes, and `val` would no longer be free for model selection); carving yet another partition out of `train`.],
+  why: [In-sample residuals are too small, because the ridge has already fitted those dishes, so a difficulty model trained on them would learn the wrong scale. Cross-fitting gives an honest residual for every one of the #thousands(m.n.train) training dishes, leaves `val` for choosing hyperparameters and does not touch `calib`. Grouped folds prevent near-duplicates from making residuals look smaller than they are.],
+)
+
+#decision("D17", [Ridge difficulty model with a floor],
+  chosen: [A ridge on the embeddings predicts $log(|r| + 0.001)$, the log of the baseline's residual. Its regularization is chosen by squared error on `val` ($lambda = #ad.difficulty.alpha$). The estimated difficulty $hat(sigma)$ is clipped from below at the 5th percentile of its values on `train`.],
+  alternatives: [$k$-nearest neighbours or gradient boosting for the difficulty; adding a constant $epsilon$ to $hat(sigma)$ instead of a floor; no lower bound.],
+  why: [
+    - Same model family as the baseline, fitted in milliseconds and easy to explain. The log makes residuals more symmetric and guarantees $hat(sigma) > 0$.
+    - A near-zero $hat(sigma)$ would give an almost empty interval and an enormous calibration score. A percentile floor avoids that without choosing an arbitrary constant, and it does not affect the guarantee, which holds for any score.
+  ],
+  evidence: [The difficulty model ranks dishes by error only weakly: Spearman correlation #num(ad.difficulty.spearman_val, d: 2) between $hat(sigma)$ and the true residual on `val`. Even so, normalized conformal has the best interval score (@tab:adaptive). #pct(ad.difficulty.floored_share_test, d: 0) of test dishes sit at the floor.],
+  consequences: [A better difficulty model is the most direct way to improve these intervals; $k$-nearest neighbours is the natural next candidate.],
+)
+
+#decision("D18", [Linear CQR with one shared correction],
+  chosen: [Two linear quantile regressions (L1 penalty, chosen by pinball loss on `val`) predict the $alpha \/ 2$ and $1 - alpha \/ 2$ quantiles of $log(1 + "kcal")$. Calibration applies one correction to both ends, as in the original method @romano2019conformalized. Crossed quantiles are swapped. The models are fitted once per $alpha$ of the notebook slider.],
+  alternatives: [Gradient boosting with a quantile loss; a small PyTorch network with pinball loss; calibrating each tail separately with $alpha \/ 2$.],
+  why: [
+    - Linear quantile regression is the same family as the baseline, so the comparison is fair, and it beat gradient boosting on `val` (pinball loss of the upper quantile: #num(ad.quantiles.val_pinball_upper_linear, d: 3) against #num(ad.quantiles.val_pinball_upper_boosting, d: 3)).
+    - The shared correction is the standard, citable method. The two-tailed version guarantees each tail but gives wider intervals; it is worth adding only if misses concentrate on one side.
+    - Two independent regressions can cross; swapping them is the usual fix and does not affect the guarantee.
+  ],
+  evidence: [Chosen penalties: #ad.quantiles.l1.lower (lower) and #ad.quantiles.l1.upper (upper). Crossed quantiles: #ad.quantiles.crossed_calib in `calib`, #ad.quantiles.crossed_test in `test`.],
+)
+
+#decision("D19", [Interval score and coverage by group to compare variants],
+  chosen: [Rank variants by the interval score (width plus $2 \/ alpha$ times the miss distance). Check how evenly they spread coverage across quartiles of *predicted* kcal and across numbers of ingredients, and keep quartiles of true kcal for continuity with the baseline. Check the guarantee of every variant with #thousands(m.resampling.n_reps) re-splits of `calib` + `test`.],
+  alternatives: [Coverage and width reported separately; grouping by mass.],
+  why: [
+    - Coverage and width pull in opposite directions; the interval score combines them in one number.
+    - Predicted kcal is the only grouping known when predicting, so it is what a user of the demo experiences. The number of ingredients is a label, not known at prediction time, but it describes which dishes are hard. Mass is left out: it is also a label and is almost the same information as calories.
+    - The official split is a single draw. Re-splitting shows whether a low coverage is a flaw of the method or just that draw.
+  ],
+  evidence: [
+    @fig:adaptive shows the coverage per quartile of predicted kcal. CQR spreads coverage most evenly across predicted kcal (gap of #pct(ad.spread_predicted.at(CQRL).gap, d: 0)) and normalized conformal across numbers of ingredients (#pct(ad.spread_ingredients.at(NORM).gap, d: 0)).
+
+    CQR covers only #pct(av(CQRL).coverage) on the official test split, but its mean over re-splits is #pct(ad.resampled.at(CQRL).mean) ± #pct(ad.resampled.at(CQRL).sd): the official split is unlucky for it (only #pct(ad.resampled.at(CQRL).share_below_official, d: 0) of re-splits do worse), not a flaw of the method.
+  ],
+)
+
+#figure(
+  image("figures/adaptive_by_predicted.svg", width: 100%),
+  caption: [Coverage and mean interval width of the four variants per quartile of predicted kcal in test. The horizontal line marks the 90% target.],
+) <fig:adaptive>
 
 = Tooling and documentation <sec:tooling>
 
@@ -267,7 +348,7 @@ All numbers come from `docs/figures/metrics.json`, which `uv run python docs/mak
 = Open questions <sec:open>
 
 + *Grouping.* Is there a better signal than ingredients and timestamps for the official incremental groups?
-+ *Adaptive intervals.* Do normalized conformal and CQR fix the under-coverage of very small and very large dishes?
++ *Difficulty model.* Can a better $hat(sigma)$ (for example $k$-nearest neighbours in embedding space) make normalized conformal clearly better than CQR?
 + *Fine-tuning.* Does a fine-tuned ViT beat the frozen baseline, and does DINOv3 overtake DINOv2 once fine-tuned?
 + *Quantization.* Does exporting the model to int8 ONNX break coverage, or only widen the intervals?
 

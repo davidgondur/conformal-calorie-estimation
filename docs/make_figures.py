@@ -15,10 +15,19 @@ import altair as alt
 import numpy as np
 import polars as pl
 from PIL import Image
+from scipy.stats import spearmanr
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from conformal_calorie_estimation.adaptive import (
+    adaptive_intervals,
+    fit_difficulty,
+    fit_quantiles,
+    pinball_loss,
+    resampled_adaptive_coverage,
+)
 from conformal_calorie_estimation.baseline import (
     RIDGE_ALPHAS,
     fit_log_ridge,
@@ -32,6 +41,7 @@ from conformal_calorie_estimation.conformal import (
     coverage,
     coverage_by_group,
     coverage_distribution,
+    interval_score,
     quantile_groups,
     resampled_coverage,
 )
@@ -61,6 +71,10 @@ INK, MUTED, GRID = "#111111", "#5B6270", "#E3E5E8"
 MUL, ADD = "multiplicative (log)", "additive (kcal)"
 VARIANTS = [MUL, ADD]
 LABELS = {"multiplicative": MUL, "additive": ADD}
+NORM, CQR = "normalized (log)", "CQR (log)"
+ALL_LABELS = {"additive": ADD, "multiplicative": MUL, "normalized": NORM, "cqr": CQR}
+# Four-colour palette validated with the dataviz checker (CVD, contrast, chroma).
+ALL_COLORS = {MUL: BLUE, ADD: ORANGE, NORM: "#2E8B57", CQR: "#8A4FBF"}
 
 
 @alt.theme.register("docs", enable=True)
@@ -302,6 +316,91 @@ def main() -> None:
         )
     save(alt.hconcat(*panels, spacing=30), "coverage_resampled")
 
+    # ------------------------------------------------------ adaptive variants
+    difficulty = fit_difficulty(data, fit, seed=SEED)
+    qfit = fit_quantiles(data, ALPHA)
+    adaptive = {ALL_LABELS[v]: lohi for v, lohi in adaptive_intervals(data, fit, difficulty, qfit, ALPHA).items()}
+    val_residual = np.abs(np.log1p(y["val"]) - pred_log["val"])
+    pred_groups, pred_labels = quantile_groups(pred["test"], n=4)
+    n_ingr = np.array([len(dishes[i].ingredients) for i in parts["test"]])
+    ingr_groups, ingr_labels = np.digitize(n_ingr, [2, 6, 13]), ["1", "2–5", "6–12", "13+"]
+    adaptive_resampled = resampled_adaptive_coverage(data, fit, difficulty, qfit, n_reps=N_REPS, seed=SEED)
+
+    def by(groups, names):
+        return [
+            {"variant": v, "group": names[g], "order": g, "n": st["n"], "coverage": st["coverage"], "width": st["mean_width"]}
+            for v, (lo, hi) in adaptive.items()
+            for g, st in coverage_by_group(yt, lo, hi, groups).items()
+        ]
+
+    by_pred, by_ingr = by(pred_groups, pred_labels), by(ingr_groups, ingr_labels)
+    all_colors = alt.Scale(domain=list(ALL_COLORS), range=list(ALL_COLORS.values()))
+    x_g = alt.X("group:N", sort=pred_labels, title="Predicted kcal (test quartile)", axis=alt.Axis(labelAngle=0))
+    off = alt.XOffset("variant:N", sort=list(ALL_COLORS))
+    color = alt.Color("variant:N", scale=all_colors, title=None)
+    bar4 = {"cornerRadiusTopLeft": 2, "cornerRadiusTopRight": 2, "width": alt.RelativeBandSize(0.85)}
+    cov4 = (
+        alt.Chart(pl.DataFrame(by_pred)).mark_bar(**bar4).encode(
+            x=x_g, xOffset=off, color=color,
+            y=alt.Y("coverage:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%"), title="Coverage"),
+        )
+        + alt.Chart(pl.DataFrame({"y": [1 - ALPHA]})).mark_rule(color=INK, strokeWidth=1).encode(y="y:Q")
+    ).properties(width=260, height=200, title="Coverage")
+    width4 = (
+        alt.Chart(pl.DataFrame(by_pred)).mark_bar(**bar4).encode(
+            x=x_g, xOffset=off, color=color, y=alt.Y("width:Q", title="kcal"),
+        )
+    ).properties(width=260, height=200, title="Mean interval width")
+    save(alt.hconcat(cov4, width4, spacing=30), "adaptive_by_predicted")
+
+    def spread(rows):
+        out = {}
+        for r in rows:
+            lo_, hi_ = out.get(r["variant"], (1.0, 0.0))
+            out[r["variant"]] = (min(lo_, r["coverage"]), max(hi_, r["coverage"]))
+        return {v: {"worst": a, "best": b, "gap": b - a} for v, (a, b) in out.items()}
+
+    adaptive_metrics = {
+        "difficulty": {
+            "alpha": difficulty.alpha,
+            "floor": difficulty.floor,
+            "spearman_val": float(spearmanr(difficulty.sigma(X["val"]), val_residual).statistic),
+            "floored_share_test": float(np.mean(difficulty.sigma(X["test"]) <= difficulty.floor)),
+        },
+        "quantiles": {
+            "l1": qfit.l1,
+            "crossed_test": qfit.predict(X["test"])[2],
+            "crossed_calib": qfit.predict(X["calib"])[2],
+            # Why a linear model: val pinball loss of the upper quantile against gradient boosting.
+            "val_pinball_upper_linear": min(r["val_pinball"] for r in qfit.search if r["side"] == "upper"),
+            "val_pinball_upper_boosting": pinball_loss(
+                np.log1p(y["val"]),
+                HistGradientBoostingRegressor(loss="quantile", quantile=1 - ALPHA / 2, random_state=SEED)
+                .fit(X["train"], np.log1p(y["train"]))
+                .predict(X["val"]),
+                1 - ALPHA / 2,
+            ),
+        },
+        "variants": {
+            v: {
+                "coverage": coverage(yt, lo, hi),
+                "width_mean": float(np.mean(hi - lo)),
+                "width_median": float(np.median(hi - lo)),
+                "interval_score": interval_score(yt, lo, hi, ALPHA),
+            }
+            for v, (lo, hi) in adaptive.items()
+        },
+        "by_predicted": by_pred,
+        "by_ingredients": by_ingr,
+        "spread_predicted": spread(by_pred),
+        "spread_ingredients": spread(by_ingr),
+        "resampled": {
+            ALL_LABELS[v]: {"mean": float(c.mean()), "sd": float(c.std()),
+                            "share_below_official": float(np.mean(c <= coverage(yt, *adaptive[ALL_LABELS[v]])))}
+            for v, c in adaptive_resampled.items()
+        },
+    }
+
     lo, hi = ints[MUL]
     examples = []
     for n, i in enumerate(np.random.default_rng(SEED).choice(len(yt), 4, replace=False)):
@@ -341,9 +440,10 @@ def main() -> None:
             },
         },
         "examples": examples,
+        "adaptive": adaptive_metrics,
     }
     (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
-    print(json.dumps({k: metrics[k] for k in ("n", "best_alpha", "mae", "coverage", "resampling")}, indent=1))
+    print(json.dumps({k: metrics["adaptive"][k] for k in ("difficulty", "quantiles", "variants", "spread_predicted", "spread_ingredients", "resampled")}, indent=1))
 
 
 if __name__ == "__main__":

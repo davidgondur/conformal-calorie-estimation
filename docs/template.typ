@@ -71,10 +71,9 @@
   show ref: set text(weight: 600, fill: color-palette.secondary)
   show footnote: set text(weight: 600, fill: color-palette.secondary)
 
-  set heading(numbering: (..n) => {
-    let n = n.pos()
-    if n.len() == 1 { "Section " + str(n.first()) + "." } else { numbering("1.", ..n) }
-  })
+  // Plain numbers: references add "Section" themselves, and the chapter
+  // opener below prints "Section N" above the title.
+  set heading(numbering: "1.")
   show heading: set block(below: 12pt)
   show heading: smallcaps
   show heading.where(level: 1): set text(18pt, weight: "semibold", number-type: "old-style")

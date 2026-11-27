@@ -79,6 +79,58 @@ def conformal_intervals(
     }
 
 
+def normalized_interval(
+    y_cal: np.ndarray,
+    pred_log_cal: np.ndarray,
+    sigma_cal: np.ndarray,
+    pred_log: np.ndarray,
+    sigma: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalized conformal on the log1p(kcal) scale, returned in kcal.
+
+    Scores are residuals divided by the estimated difficulty ``sigma`` of each
+    point, so the interval ``pred ± q * sigma`` is wider where the model
+    expects to be wrong. ``sigma`` must be positive.
+    """
+    scores = np.abs(np.log1p(y_cal) - pred_log_cal) / sigma_cal
+    q = conformal_quantile(scores, alpha)
+    half = q * np.asarray(sigma, dtype=float)
+    return np.expm1(pred_log - half).clip(0), np.expm1(pred_log + half)
+
+
+def cqr_interval(
+    y_cal: np.ndarray,
+    lo_log_cal: np.ndarray,
+    hi_log_cal: np.ndarray,
+    lo_log: np.ndarray,
+    hi_log: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Conformalized quantile regression (Romano et al., 2019) on log1p(kcal), in kcal.
+
+    ``lo_log`` / ``hi_log`` are predicted lower and upper quantiles. The score
+    is how far the truth falls outside them (negative when inside); one
+    correction ``q`` widens (or narrows, if negative) both ends.
+    """
+    y_log = np.log1p(y_cal)
+    scores = np.maximum(lo_log_cal - y_log, y_log - hi_log_cal)
+    q = conformal_quantile(scores, alpha)
+    return np.expm1(np.asarray(lo_log) - q).clip(0), np.expm1(np.asarray(hi_log) + q)
+
+
+def interval_score(y: np.ndarray, lower: np.ndarray, upper: np.ndarray, alpha: float) -> float:
+    """Mean interval (Winkler) score: width plus 2/alpha times the miss distance.
+
+    Lower is better. It rewards narrow intervals but penalizes every unit by
+    which the truth falls outside, so it balances width against misses.
+    """
+    y, lower, upper = (np.asarray(a, dtype=float) for a in (y, lower, upper))
+    below = np.clip(lower - y, 0, None)
+    above = np.clip(y - upper, 0, None)
+    return float(np.mean((upper - lower) + 2 / alpha * (below + above)))
+
+
 # --------------------------------------------------------------------------
 # Diagnostics
 # --------------------------------------------------------------------------
@@ -114,6 +166,49 @@ def coverage_by_group(
 # --------------------------------------------------------------------------
 
 
+def resample_splits(
+    n_items: int,
+    n_cal: int,
+    n_reps: int = 1000,
+    groups: np.ndarray | None = None,
+    seed: int = 0,
+):
+    """Yield ``n_reps`` boolean calibration masks over a pool of ``n_items``.
+
+    Each mask selects about ``n_cal`` items (whole ``groups`` at a time); the
+    complement is the test set.
+    """
+    labels = np.arange(n_items) if groups is None else np.unique(groups, return_inverse=True)[1]
+    sizes = np.bincount(labels)
+    rng = np.random.default_rng(seed)
+    for _ in range(n_reps):
+        order = rng.permutation(len(sizes))
+        k = int(np.searchsorted(np.cumsum(sizes[order]), n_cal)) + 1
+        yield np.isin(labels, order[:k])
+
+
+def resampled_coverage_of(
+    y: np.ndarray,
+    interval_fn,
+    n_cal: int,
+    n_reps: int = 1000,
+    groups: np.ndarray | None = None,
+    seed: int = 0,
+) -> dict[str, np.ndarray]:
+    """Test coverage of any set of variants over random calibration/test splits.
+
+    ``interval_fn(cal_mask)`` must return ``{variant: (lower, upper)}`` for the
+    points outside ``cal_mask``, calibrated on the points inside it, with a
+    model that is fixed and has not seen the pool.
+    """
+    y = np.asarray(y, dtype=float)
+    out: dict[str, list[float]] = {}
+    for cal in resample_splits(len(y), n_cal, n_reps, groups, seed):
+        for v, (lo, hi) in interval_fn(cal).items():
+            out.setdefault(v, []).append(coverage(y[~cal], lo, hi))
+    return {v: np.array(c) for v, c in out.items()}
+
+
 def resampled_coverage(
     y: np.ndarray,
     pred_log: np.ndarray,
@@ -123,26 +218,17 @@ def resampled_coverage(
     groups: np.ndarray | None = None,
     seed: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Test coverage of each variant over ``n_reps`` random calibration/test splits.
+    """Coverage of the additive and multiplicative variants over random re-splits.
 
     The model is fixed (``pred_log`` are its predictions for a pool of points
-    it has not seen). Each repetition draws about ``n_cal`` calibration points
-    from the pool, keeping whole ``groups`` together, and measures coverage on
-    the rest. Returns ``{variant: array of n_reps coverages}``.
+    it has not seen). Returns ``{variant: array of n_reps coverages}``.
     """
     y, pred_log = np.asarray(y, dtype=float), np.asarray(pred_log, dtype=float)
-    labels = np.arange(len(y)) if groups is None else np.unique(groups, return_inverse=True)[1]
-    sizes = np.bincount(labels)
-    rng = np.random.default_rng(seed)
-    out = {v: np.empty(n_reps) for v in VARIANTS}
-    for r in range(n_reps):
-        order = rng.permutation(len(sizes))
-        k = int(np.searchsorted(np.cumsum(sizes[order]), n_cal)) + 1
-        cal = np.isin(labels, order[:k])
-        ints = conformal_intervals(y[cal], pred_log[cal], pred_log[~cal], alpha)
-        for v, (lo, hi) in ints.items():
-            out[v][r] = coverage(y[~cal], lo, hi)
-    return out
+    return resampled_coverage_of(
+        y,
+        lambda cal: conformal_intervals(y[cal], pred_log[cal], pred_log[~cal], alpha),
+        n_cal, n_reps, groups, seed,
+    )
 
 
 def coverage_distribution(n_cal: int, n_test: int, alpha: float) -> tuple[np.ndarray, np.ndarray]:

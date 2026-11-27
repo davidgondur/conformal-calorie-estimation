@@ -27,8 +27,8 @@ The project turns a photo of a dish into a calorie estimate with an interval tha
     [Data], [Nutrition5k, Google Cloud Storage over HTTPS], [@sec:data],
     [Deep learning], [PyTorch, `timm`], [@sec:dl],
     [Image representation], [Vision Transformers, DINOv2], [@sec:vit],
-    [Point prediction], [scikit-learn: standardization and ridge regression], [@sec:regression],
-    [Uncertainty], [Split conformal prediction], [@sec:conformal],
+    [Point prediction], [scikit-learn: standardization, ridge and quantile regression], [@sec:regression],
+    [Uncertainty], [Split conformal prediction, normalized conformal, CQR], [@sec:conformal],
     [Analysis], [marimo, Polars, Altair / Vega-Lite], [@sec:analysis],
     [Documentation], [Typst], [@sec:typst],
   ),
@@ -285,6 +285,66 @@ Both keep the marginal guarantee, but they spread coverage very differently (@fi
   ),
   caption: [Test dishes with their prediction and their 90% multiplicative interval.],
 )
+
+== Adaptive intervals <sec:adaptive>
+
+#let ad = m.adaptive
+#let av(v) = ad.variants.at(v)
+#let NORM = "normalized (log)"
+#let CQRL = "CQR (log)"
+
+The variants so far use the same margin for every dish on their scale: their width depends only on the predicted *size*. An *adaptive* interval should also depend on how *hard* the dish is: narrow for a plain salad, wide for an opaque stew. Two standard methods achieve this, both built here on the $log(1 + "kcal")$ scale (notebook `notebooks/adaptive.py`, code in `adaptive.py`).
+
+=== Normalized conformal
+
+The idea is to divide each residual by an estimate of how large it should be:
+
+$ s_i = (|y_i - hat(y)_i|) / (hat(sigma)(bold(x)_i)), quad "interval" = hat(y) plus.minus hat(q) dot hat(sigma)(bold(x)) . $
+
+The quantile $hat(q)$ is computed exactly as before, so the guarantee is unchanged: dividing by $hat(sigma)$ only changes the *shape* of the score. If $hat(sigma)$ is good, hard dishes get wide intervals and easy dishes narrow ones; if it is useless, the method falls back to roughly the plain interval.
+
+$hat(sigma)$ is a second model, the *difficulty model*: a ridge on the embeddings that predicts the logarithm of the baseline's absolute residual. Training it needs residuals that look like residuals on new dishes, and residuals on the training set do not: the ridge has already fitted those dishes, so they are too small. *Cross-fitting* solves this: `train` is split into 5 folds (keeping incremental groups together), each fold is predicted by a ridge trained on the other four, and every dish ends up with an honest, out-of-fold residual.
+
+=== Quantile regression and the pinball loss
+
+Ordinary regression predicts the mean. *Quantile regression* predicts a quantile instead: for example the value below which 95% of dishes like this one fall. It is trained by minimizing the *pinball loss*, which penalizes under- and over-predictions asymmetrically:
+
+$ L_tau (y, hat(y)) = cases(tau (y - hat(y)) & "if" y >= hat(y), (1 - tau)(hat(y) - y) & "otherwise") $
+
+For $tau = 0.95$, predicting too low costs 19 times more than predicting too high, so the minimizer sits where only 5% of the values are above it. scikit-learn's `QuantileRegressor` fits a linear model with this loss and an L1 penalty.
+
+=== Conformalized quantile regression (CQR)
+
+Quantile regression alone has no guarantee: on new data, the predicted 5% and 95% quantiles may cover 80% or 95% of dishes. CQR @romano2019conformalized calibrates them. With predicted quantiles $hat(q)_"lo"(bold(x))$ and $hat(q)_"hi"(bold(x))$, the score measures how far the truth falls outside them, negative when it is inside:
+
+$ s_i = max(hat(q)_"lo"(bold(x)_i) - y_i, quad y_i - hat(q)_"hi"(bold(x)_i)), quad "interval" = [hat(q)_"lo"(bold(x)) - hat(q), quad hat(q)_"hi"(bold(x)) + hat(q)] . $
+
+If the quantile models are too narrow, $hat(q)$ is positive and widens them; if they are too wide, it is negative and narrows them. The width of each interval comes from the quantile models, so it adapts to the dish, and the calibration step restores the guarantee.
+
+=== Comparing intervals: the interval score
+
+Coverage alone rewards absurdly wide intervals, and width alone rewards intervals that miss. The *interval score* (or Winkler score) combines them:
+
+$ "IS"_alpha = (u - l) + 2 / alpha (l - y) bb(1)[y < l] + 2 / alpha (y - u) bb(1)[y > u] , $
+
+the width plus a penalty proportional to how far the truth falls outside. Lower is better.
+
+#figure(
+  table(
+    columns: (1fr, auto, auto, auto),
+    align: (left, right, right, right),
+    table.header[Variant][Coverage][Median width (kcal)][Interval score],
+    ..(ADD, MUL, NORM, CQRL).map(v => (v, pct(av(v).coverage), num(av(v).width_median, d: 0), num(av(v).interval_score, d: 0))).flatten(),
+  ),
+  caption: [The four variants on test, $alpha = #num(m.alpha)$ (target 90%).],
+) <tab:adaptive>
+
+Both adaptive variants improve on the baseline intervals (@tab:adaptive, @fig:adaptive). Normalized conformal has the best interval score even though its difficulty model is weak (Spearman correlation #num(ad.difficulty.spearman_val, d: 2) between predicted and actual error). CQR gives the smallest median width and the most even coverage across predicted sizes. Its coverage on the official test split is low (#pct(av(CQRL).coverage)), but over #thousands(m.resampling.n_reps) re-splits its mean is #pct(ad.resampled.at(CQRL).mean): the guarantee holds, and the official split happens to be an unlucky draw for it.
+
+#figure(
+  image("figures/adaptive_by_predicted.svg", width: 100%),
+  caption: [Coverage and mean width of the four variants per quartile of predicted kcal in test ($alpha = #num(m.alpha)$).],
+) <fig:adaptive>
 
 = Analysis tools <sec:analysis>
 
