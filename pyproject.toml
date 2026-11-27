@@ -31,4 +31,5 @@ dev = [
     "polars>=2.2.0",
     "pytest>=9.2.0",
     "ruff>=0.17.6",
+    "vl-convert-python>=1.9.0.post1",
 ]

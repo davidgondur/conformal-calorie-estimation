@@ -21,3 +21,6 @@ data/
 *.pt
 *.pth
 *.ckpt
+
+# Generated documents
+docs/*.pdf
