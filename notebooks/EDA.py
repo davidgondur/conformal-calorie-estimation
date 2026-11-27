@@ -103,7 +103,7 @@ def chart_calories(alt, df, mo):
             y=alt.Y("count():Q", stack=None, title="Platos"),
         )
     )
-    mo.ui.altair_chart((_lin.properties(width=320) | _log.properties(width=320)))
+    _lin.properties(width=320) | _log.properties(width=320)
 
 
 @app.cell
@@ -140,7 +140,7 @@ def chart_mass(alt, df, mo):
         )
         .properties(width=300, height=300)
     )
-    mo.ui.altair_chart(_scatter | _density)
+    _scatter | _density
 
 
 @app.cell
@@ -200,7 +200,7 @@ def ingredients(alt, df, dishes, mo, pl, splits):
         )
         .properties(width=260, height=260)
     )
-    mo.ui.altair_chart(_n_ingr | _top_chart)
+    _n_ingr | _top_chart
 
 
 @app.cell
