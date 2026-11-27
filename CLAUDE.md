@@ -13,6 +13,8 @@ Talk to the user, and write the README and notebook prose, in Spanish. Everythin
 - `uv run python docs/make_figures.py`, then `typst compile docs/decisions.typ` and `docs/technologies.typ`: the documents read every number from `docs/figures/metrics.json`. Regenerate it whenever the baseline changes; never type results into a `.typ` by hand.
 - When a decision is taken or reversed, add or update its entry in `docs/decisions.typ`. When a technology enters the code, explain it in `docs/technologies.typ`; that document only covers what the code actually uses.
 
+The baseline recipe (data preparation, ridge, conformal intervals, diagnostics) lives in `baseline.py` and `conformal.py`. Notebooks and `docs/make_figures.py` import it; extend those modules rather than reimplementing logic in a consumer.
+
 Python is pinned to 3.13 because torch and onnxruntime have no 3.15 wheels.
 
 ## Splits: the coverage guarantee depends on these

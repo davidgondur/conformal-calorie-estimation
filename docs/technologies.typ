@@ -229,7 +229,36 @@ The guarantee is *marginal*: it holds on average over dishes. It says nothing ab
   caption: [Coverage on test against the target $1 - alpha$. The grey line is perfect calibration.],
 ) <fig:alpha>
 
-== The scale of the scores
+== Coverage varies with the calibration set
+
+The guarantee is also an average *over calibration sets*: a different calibration set would have given a slightly different $hat(q)$, and so a different coverage. This can be measured. The model is kept fixed, the #m.resampling.n_cal calibration dishes and the #m.resampling.n_test test dishes are pooled, and the pool is split again at random #thousands(m.resampling.n_reps) times into a calibration set of the same size and a test set with the rest. Each split gives one coverage value (@fig:resampled).
+
+Theory predicts the exact distribution of those values. For a fixed model and $n$ calibration points, with $k = ceil((n + 1)(1 - alpha))$, the coverage on infinitely many new points follows a $"Beta"(k, n + 1 - k)$ distribution. Measuring it on a finite test set adds binomial noise, so the observed fraction follows a *Beta-Binomial* distribution, available as `scipy.stats.betabinom`. Its spread has two sources, the calibration draw and the finite test set, and here it is #pct(m.resampling.theory_mean) ± #pct(m.resampling.theory_sd).
+
+#let rs = m.resampling
+#figure(
+  table(
+    columns: (1fr, auto, auto),
+    align: (left, right, right),
+    table.header[Re-split by][Multiplicative (log)][Additive (kcal)],
+    [Theory (Beta-Binomial)], [#pct(rs.theory_mean) ± #pct(rs.theory_sd)], [#pct(rs.theory_mean) ± #pct(rs.theory_sd)],
+    [Single dishes], [#pct(rs.dishes.at(MUL).mean) ± #pct(rs.dishes.at(MUL).sd)], [#pct(rs.dishes.at(ADD).mean) ± #pct(rs.dishes.at(ADD).sd)],
+    [Incremental groups], [#pct(rs.groups.at(MUL).mean) ± #pct(rs.groups.at(MUL).sd)], [#pct(rs.groups.at(ADD).mean) ± #pct(rs.groups.at(ADD).sd)],
+  ),
+  caption: [Mean ± standard deviation of test coverage over #thousands(rs.n_reps) random calibration/test re-splits ($alpha = #num(m.alpha)$).],
+) <tab:resampled>
+
+Two things stand out (@tab:resampled):
+
+- *The theory does not depend on the model.* The additive and the multiplicative intervals, which spread coverage so differently across dishes (@sec:scale), have the same distribution of overall coverage, and both match the theoretical curve.
+- *Exchangeability is about the unit that is shuffled.* When single dishes are shuffled, the spread matches the theory. When whole incremental groups are kept together, as everywhere else in the project, the spread is larger: dishes in a group are near-duplicates, so the pool holds less independent information than its size suggests. The average is unchanged; only the fluctuation around it grows.
+
+#figure(
+  image("figures/coverage_resampled.svg", width: 100%),
+  caption: [Test coverage over #thousands(rs.n_reps) re-splits that keep incremental groups together. The black curve is the Beta-Binomial predicted by theory; the grey line is the target $1 - alpha$.],
+) <fig:resampled>
+
+== The scale of the scores <sec:scale>
 
 The residuals can be measured on any scale, and the choice changes the shape of the intervals:
 

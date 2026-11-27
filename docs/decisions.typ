@@ -206,7 +206,7 @@ All numbers come from `docs/figures/metrics.json`, which `uv run python docs/mak
 = Uncertainty <sec:conformal>
 
 #decision("D11", [Own implementation of split conformal],
-  chosen: [Implement the conformal quantile, the interval and the coverage in `conformal.py` (about 40 lines, with tests).],
+  chosen: [Implement split conformal in `conformal.py`: the quantile, both interval variants, coverage diagnostics and the re-split experiment, all with tests. `notebooks/baseline.py` and `docs/make_figures.py` import it instead of reimplementing it.],
   alternatives: [MAPIE, which is already a dependency.],
   why: [The formulas are the point of the project. Writing them out keeps the finite-sample correction and the scale of the residuals explicit and easy to explain. A simulation test checks that coverage holds on exchangeable data. MAPIE stays available to cross-check results and for the methods that come next.],
 )

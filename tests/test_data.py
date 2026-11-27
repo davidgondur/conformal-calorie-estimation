@@ -87,7 +87,7 @@ def test_split_by_groups_keeps_groups_together(root: Path):
     train = official_splits(root)["train"]
     parts = split_by_groups(train, read_dishes(root), {"val": 0.1, "calib": 0.2}, seed=1)
     assert [len(parts[k]) for k in ("val", "calib", "train")] == [2, 4, 14]
-    assert sorted(sum(parts.values(), [])) == train
+    assert sorted(i for ids in parts.values() for i in ids) == train
     plates = {k: {int(i[5:]) // 10_000 for i in v} for k, v in parts.items()}
     assert not (plates["val"] & plates["calib"] or plates["val"] & plates["train"]
                 or plates["calib"] & plates["train"])

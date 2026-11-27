@@ -174,6 +174,33 @@
       "width_median": 328.47713837865086
     }
   ],
+  "resampling": {
+    "n_reps": 1000,
+    "n_cal": 552,
+    "n_test": 507,
+    "theory_mean": 0.9005424954788174,
+    "theory_sd": 0.018385055931276317,
+    "groups": {
+      "multiplicative (log)": {
+        "mean": 0.9001272912134611,
+        "sd": 0.021253050192187765
+      },
+      "additive (kcal)": {
+        "mean": 0.9009863867224196,
+        "sd": 0.022675360597300232
+      }
+    },
+    "dishes": {
+      "multiplicative (log)": {
+        "mean": 0.9009901380670612,
+        "sd": 0.0178361770768906
+      },
+      "additive (kcal)": {
+        "mean": 0.9001282051282051,
+        "sd": 0.018270281480724036
+      }
+    }
+  },
   "examples": [
     {
       "file": "figures/example_0.jpg",

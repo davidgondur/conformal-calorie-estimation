@@ -11,45 +11,43 @@ def _():
     import numpy as np
     import polars as pl
     from PIL import Image
-    from sklearn.linear_model import Ridge
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
 
+    from conformal_calorie_estimation.baseline import (
+        fit_log_ridge,
+        group_labels,
+        mae,
+        prepare_baseline,
+    )
     from conformal_calorie_estimation.conformal import (
-        absolute_residual_interval,
+        conformal_intervals,
         conformal_quantile,
         coverage,
+        coverage_by_group,
+        coverage_distribution,
+        quantile_groups,
+        resampled_coverage,
     )
-    from conformal_calorie_estimation.data import (
-        clean_train,
-        image_path,
-        label_problem,
-        official_splits,
-        read_dishes,
-        split_by_groups,
-    )
-    from conformal_calorie_estimation.features import DEFAULT_MODEL, cached_features
+    from conformal_calorie_estimation.data import image_path, label_problem
 
     return (
-        DEFAULT_MODEL,
         Image,
-        Ridge,
-        StandardScaler,
-        absolute_residual_interval,
         alt,
-        cached_features,
-        clean_train,
+        conformal_intervals,
         conformal_quantile,
         coverage,
+        coverage_by_group,
+        coverage_distribution,
+        fit_log_ridge,
+        group_labels,
         image_path,
         label_problem,
-        make_pipeline,
+        mae,
         mo,
         np,
-        official_splits,
         pl,
-        read_dishes,
-        split_by_groups,
+        prepare_baseline,
+        quantile_groups,
+        resampled_coverage,
     )
 
 
@@ -82,22 +80,15 @@ def _(mo):
 
 
 @app.cell
-def _(clean_train, mo, official_splits, read_dishes, split_by_groups):
+def _(mo, prepare_baseline):
     ROOT = mo.notebook_dir().parent / "data" / "nutrition5k"
     FEATURES_DIR = mo.notebook_dir().parent / "data" / "features"
     SEED = 0
 
-    dishes = read_dishes(ROOT)
-    official = official_splits(ROOT)
-    _parts = split_by_groups(official["train"], dishes, {"val": 0.1, "calib": 0.2}, seed=SEED)
-    removed = sorted(set(_parts["train"]) - set(clean_train(_parts["train"], dishes)))
-    parts = {
-        "train": clean_train(_parts["train"], dishes),
-        "val": _parts["val"],
-        "calib": _parts["calib"],
-        "test": official["test"],
-    }
-    return FEATURES_DIR, ROOT, dishes, official, parts, removed
+    # Splits, cleaning of the training part and cached embeddings (see README).
+    data = prepare_baseline(ROOT, FEATURES_DIR, seed=SEED, fractions={"val": 0.1, "calib": 0.2})
+    dishes, parts, removed, X, kcal = data.dishes, data.parts, data.removed, data.X, data.kcal
+    return ROOT, SEED, X, dishes, kcal, parts, removed
 
 
 @app.cell
@@ -126,57 +117,22 @@ def _(mo):
     mo.md(r"""
     ## Embeddings y regresión
 
-    Los embeddings se calculan una vez y se guardan en `data/features/` (en GPU, unos
-    segundos). El objetivo es `log1p(kcal)`: la distribución de calorías es muy
-    asimétrica, y en escala logarítmica los errores son relativos (±30 % en lugar
+    Los embeddings de DINOv2 se calculan una vez y se guardan en `data/features/`
+    (en GPU, unos segundos). El objetivo es `log1p(kcal)`: la distribución de calorías
+    es muy asimétrica, y en escala logarítmica los errores son relativos (±30 % en lugar
     de ±150 kcal). `log1p` en vez de `log` porque test tiene un plato con 0 kcal.
+    La regularización se elige solo con `val`: `calib` y `test` no influyen en el modelo.
     """)
 
 
 @app.cell
-def _(
-    DEFAULT_MODEL,
-    FEATURES_DIR,
-    ROOT,
-    cached_features,
-    dishes,
-    np,
-    official,
-    parts,
-):
-    _features = cached_features(
-        ROOT, official["train"] + official["test"], FEATURES_DIR, model_name=DEFAULT_MODEL
-    )
-    X = {k: np.stack([_features[i] for i in ids]) for k, ids in parts.items()}
-    kcal = {k: np.array([dishes[i].calories for i in ids]) for k, ids in parts.items()}
-    return X, kcal
-
-
-@app.cell
-def _(Ridge, StandardScaler, X, kcal, make_pipeline, np, pl):
-    def fit_ridge(alpha):
-        return make_pipeline(StandardScaler(), Ridge(alpha=alpha)).fit(
-            X["train"], np.log1p(kcal["train"])
-        )
-
-    def mae(y, pred):
-        return float(np.mean(np.abs(y - pred)))
-
-    # Regularization chosen on val only; calib and test are not looked at.
-    _alphas = [1, 10, 30, 100, 300, 1000, 3000, 10000]
-    ridge_search = pl.DataFrame(
-        {
-            "alpha": _alphas,
-            "val_MAE_kcal": [
-                mae(kcal["val"], np.expm1(fit_ridge(a).predict(X["val"]))) for a in _alphas
-            ],
-        }
-    )
-    best_alpha = ridge_search.sort("val_MAE_kcal")["alpha"][0]
-    model = fit_ridge(best_alpha)
-    pred_log = {k: model.predict(x) for k, x in X.items()}
+def _(X, fit_log_ridge, kcal, np, pl):
+    ridge = fit_log_ridge(X, kcal)
+    ridge_search = pl.DataFrame(ridge.search)
+    best_alpha = ridge.alpha
+    pred_log = {k: ridge.model.predict(x) for k, x in X.items()}
     pred_kcal = {k: np.expm1(p).clip(0) for k, p in pred_log.items()}
-    return best_alpha, mae, pred_kcal, pred_log, ridge_search
+    return best_alpha, pred_kcal, pred_log, ridge_search
 
 
 @app.cell
@@ -186,7 +142,7 @@ def _(alt, best_alpha, kcal, mae, mo, np, pred_kcal, ridge_search):
         .mark_line(point=True)
         .encode(
             x=alt.X("alpha:Q", scale=alt.Scale(type="log"), title="alpha de ridge"),
-            y=alt.Y("val_MAE_kcal:Q", scale=alt.Scale(zero=False), title="MAE en val (kcal)"),
+            y=alt.Y("val_mae:Q", scale=alt.Scale(zero=False), title="MAE en val (kcal)"),
         )
         .properties(width=320, height=220)
     )
@@ -244,22 +200,18 @@ def _(mo):
 
 
 @app.cell
-def _(absolute_residual_interval, alpha_slider, kcal, np, pred_kcal, pred_log):
+def _(alpha_slider, conformal_intervals, kcal, pred_log):
+    VARIANT_LABELS = {"multiplicative": "multiplicativo (log)", "additive": "aditivo (kcal)"}
+
+
     def intervals(alpha, split="test"):
-        """Both conformal variants for ``split``, in kcal: {name: (lower, upper)}."""
-        _lo, _hi = absolute_residual_interval(
-            np.log1p(kcal["calib"]), pred_log["calib"], pred_log[split], alpha
-        )
-        _alo, _ahi = absolute_residual_interval(
-            kcal["calib"], pred_kcal["calib"], pred_kcal[split], alpha
-        )
-        return {
-            "multiplicativo (log)": (np.expm1(_lo).clip(0), np.expm1(_hi)),
-            "aditivo (kcal)": (_alo.clip(0), _ahi),
-        }
+        """Both conformal variants for ``split``, in kcal: {label: (lower, upper)}."""
+        _ints = conformal_intervals(kcal["calib"], pred_log["calib"], pred_log[split], alpha)
+        return {VARIANT_LABELS[v]: lohi for v, lohi in _ints.items()}
+
 
     test_intervals = intervals(alpha_slider.value)
-    return intervals, test_intervals
+    return VARIANT_LABELS, intervals, test_intervals
 
 
 @app.cell
@@ -310,25 +262,29 @@ def _(mo):
 
 
 @app.cell
-def _(alpha_slider, alt, coverage, kcal, np, pl, test_intervals):
-    _y = kcal["test"]
-    _edges = np.quantile(_y, [0, 0.25, 0.5, 0.75, 1])
-    _labels = [f"{a:.0f}–{b:.0f}" for a, b in zip(_edges, _edges[1:])]
-    _bin = np.clip(np.searchsorted(_edges, _y, side="right") - 1, 0, 3)
-    _rows = []
-    for _name, (_lo, _hi) in test_intervals.items():
-        for _b, _label in enumerate(_labels):
-            _m = _bin == _b
-            _rows.append(
-                {
-                    "variante": _name,
-                    "kcal reales (cuartil)": _label,
-                    "orden": _b,
-                    "cobertura": coverage(_y[_m], _lo[_m], _hi[_m]),
-                    "ancho medio": float(np.mean(_hi[_m] - _lo[_m])),
-                }
-            )
-    by_size = pl.DataFrame(_rows)
+def _(
+    alpha_slider,
+    alt,
+    coverage_by_group,
+    kcal,
+    pl,
+    quantile_groups,
+    test_intervals,
+):
+    _groups, _labels = quantile_groups(kcal["test"], n=4)
+    by_size = pl.DataFrame(
+        [
+            {
+                "variante": _name,
+                "kcal reales (cuartil)": _labels[_g],
+                "orden": _g,
+                "cobertura": _s["coverage"],
+                "ancho medio": _s["mean_width"],
+            }
+            for _name, (_lo, _hi) in test_intervals.items()
+            for _g, _s in coverage_by_group(kcal["test"], _lo, _hi, _groups).items()
+        ]
+    )
 
     _x = alt.X("kcal reales (cuartil):N", sort=alt.SortField("orden"), title="kcal reales (cuartil)")
     _color = alt.Color("variante:N", title=None)
@@ -349,6 +305,7 @@ def _(alpha_slider, alt, coverage, kcal, np, pl, test_intervals):
     # Static chart: mo.ui.altair_chart would add the same legend
     # selection to both panels, which Vega rejects as a duplicate signal.
     _cov | _width
+    return (by_size,)
 
 
 @app.cell(hide_code=True)
@@ -380,6 +337,125 @@ def _(alt, coverage, intervals, kcal, np, pl):
         )
     )
     (_diag + _lines).properties(width=360, height=300)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## ¿Qué promete exactamente la garantía?
+
+    La cobertura ≥ 1 − α es un **promedio sobre posibles conjuntos de calibración**. Con
+    otra calibración, la cobertura medida habría sido otra. Para verlo, se deja el modelo
+    fijo, se juntan `calib` y `test` y se reparten al azar muchas veces en una calibración
+    del mismo tamaño y un test con el resto.
+
+    La teoría da la distribución exacta de la cobertura medida: con $n$ puntos de
+    calibración y $k = \lceil (n+1)(1-\alpha) \rceil$, la cobertura real sigue una
+    $\mathrm{Beta}(k,\, n+1-k)$, y medirla en un test finito añade ruido binomial, así
+    que lo observado sigue una **Beta-Binomial**. La anchura viene de esas dos fuentes:
+    la calibración y el test finito. Es la misma para los dos intervalos, porque no
+    depende ni del modelo ni de la escala de los residuos.
+
+    La teoría supone platos intercambiables uno a uno. Si se reparten **grupos** de
+    montaje enteros (como en el resto del proyecto), los platos de un grupo se parecen y
+    hay menos información independiente de la que parece: la cobertura varía algo más que
+    la curva teórica.
+    """)
+
+
+@app.cell
+def _(mo):
+    respect_groups = mo.ui.checkbox(value=True, label="Repartir por grupos de montaje")
+    respect_groups
+    return (respect_groups,)
+
+
+@app.cell
+def _(
+    SEED,
+    alpha_slider,
+    coverage_distribution,
+    dishes,
+    group_labels,
+    kcal,
+    np,
+    parts,
+    pred_log,
+    resampled_coverage,
+    respect_groups,
+):
+    _pool = parts["calib"] + parts["test"]
+    n_cal = len(parts["calib"])
+    n_pool_test = len(_pool) - n_cal
+    resampled = resampled_coverage(
+        np.concatenate([kcal["calib"], kcal["test"]]),
+        np.concatenate([pred_log["calib"], pred_log["test"]]),
+        alpha_slider.value,
+        n_cal,
+        n_reps=1000,
+        groups=group_labels(_pool, dishes) if respect_groups.value else None,
+        seed=SEED,
+    )
+    theory_grid, theory_pmf = coverage_distribution(n_cal, n_pool_test, alpha_slider.value)
+    return n_cal, n_pool_test, resampled, theory_grid, theory_pmf
+
+
+@app.cell
+def _(
+    VARIANT_LABELS,
+    alpha_slider,
+    alt,
+    mo,
+    n_cal,
+    n_pool_test,
+    np,
+    pl,
+    resampled,
+    theory_grid,
+    theory_pmf,
+):
+    _bin_width = 0.005
+    _edges = np.arange(0.70, 1.0 + _bin_width, _bin_width)
+    _hist = pl.DataFrame(
+        [
+            {"variante": VARIANT_LABELS[_v], "lo": float(_a), "hi": float(_b), "densidad": _c / (len(_covs) * _bin_width)}
+            for _v, _covs in resampled.items()
+            for _a, _b, _c in zip(_edges, _edges[1:], np.histogram(_covs, bins=_edges)[0])
+        ]
+    )
+    # Beta-Binomial pmf over coverage values spaced 1/n_test apart -> density.
+    _theory = pl.DataFrame(
+        {"cobertura": theory_grid, "densidad": theory_pmf * n_pool_test}
+    ).filter((pl.col("cobertura") >= 0.70) & (pl.col("cobertura") <= 1.0))
+    _panels = [
+        (
+            alt.Chart(_hist.filter(pl.col("variante") == _label))
+            .mark_rect(opacity=0.6)
+            .encode(
+                x=alt.X("lo:Q", title="Cobertura medida en test", axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0.75, 1])),
+                x2="hi:Q",
+                y=alt.Y("densidad:Q", title="Densidad"),
+                y2=alt.datum(0),
+            )
+            + alt.Chart(_theory).mark_line(color="black").encode(x="cobertura:Q", y="densidad:Q")
+            + alt.Chart(pl.DataFrame({"x": [1 - alpha_slider.value]})).mark_rule(strokeDash=[4, 4]).encode(x="x:Q")
+        ).properties(width=300, height=220, title=_label)
+        for _label in VARIANT_LABELS.values()
+    ]
+    _m = float(theory_grid @ theory_pmf)
+    _sd = float(np.sqrt(((theory_grid - _m) ** 2) @ theory_pmf))
+    mo.vstack(
+        [
+            alt.hconcat(*_panels),
+            mo.md(
+                f"Teoría: {_m:.1%} ± {_sd:.1%} · "
+                + " · ".join(
+                    f"{VARIANT_LABELS[_v]}: {_c.mean():.1%} ± {_c.std():.1%}" for _v, _c in resampled.items()
+                )
+                + f" (1.000 repeticiones, calibración de {n_cal} y test de unos {n_pool_test} platos)."
+            ),
+        ]
+    )
 
 
 @app.cell
@@ -436,26 +512,49 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Conclusiones (α = 0,1, semilla 0)
+def _(
+    SEED,
+    VARIANT_LABELS,
+    alpha_slider,
+    by_size,
+    coverage,
+    kcal,
+    mae,
+    mo,
+    np,
+    pred_kcal,
+    test_intervals,
+):
+    _mul, _add = VARIANT_LABELS["multiplicative"], VARIANT_LABELS["additive"]
+    _target = 1 - alpha_slider.value
+    _cov = {_name: coverage(kcal["test"], _lo, _hi) for _name, (_lo, _hi) in test_intervals.items()}
+    _q = by_size.pivot(on="variante", index="orden", values="cobertura").sort("orden")
+    _spread = {_name: float(_q[_name].max() - _q[_name].min()) for _name in (_mul, _add)}
+    _balanced, _other = (_mul, _add) if _spread[_mul] <= _spread[_add] else (_add, _mul)
+    _worst = {_name: (float(_q[_name].min()), int(_q["orden"][int(_q[_name].arg_min())]) + 1) for _name in (_mul, _add)}
+    _naive = mae(kcal["test"], np.full_like(kcal["test"], np.median(kcal["train"])))
+    _sd = np.sqrt(alpha_slider.value * (1 - alpha_slider.value) / len(kcal["test"]))
+    _close = all(abs(_c - _target) <= 2 * _sd for _c in _cov.values())
 
-    - Sin fine-tuning, el MAE en test es de unas **76 kcal (~30 % de la media)**, cerca de
-      las 70,6 kcal del modelo ajustado del artículo (con otro split y otras imágenes).
-    - Las dos variantes conformales cumplen la cobertura **en promedio** (~89 %, dentro
-      del ruido con 507 platos).
-    - El margen **aditivo** se reparte mal: cubre el 100 % de los platos pequeños con
-      intervalos de ~200 kcal y solo ~64 % de los grandes. El **multiplicativo** está
-      mucho más equilibrado (81–94 % por cuartil), aunque sigue cubriendo de menos los
-      platos muy pequeños y los muy grandes.
-    - Siguientes pasos: conformal normalizado y CQR para adaptar el ancho a la
-      dificultad de cada plato, no solo a su tamaño; y fine-tuning del ViT.
-    """)
+    mo.md(
+        f"""
+    ## Conclusiones (α = {alpha_slider.value:.2f}, semilla {SEED})
 
-
-@app.cell
-def _():
-    return
+    - Sin fine-tuning, el MAE en test es de **{mae(kcal["test"], pred_kcal["test"]):.0f} kcal**
+      ({mae(kcal["test"], pred_kcal["test"]) / kcal["test"].mean():.0%} de la media), frente a
+      {_naive:.0f} kcal prediciendo siempre la mediana. El modelo del artículo, con fine-tuning
+      y otra partición, llega a 70,6 kcal.
+    - Cobertura en test: **{_cov[_mul]:.1%}** (multiplicativo) y **{_cov[_add]:.1%}** (aditivo),
+      para un objetivo de {_target:.0%}. {"Las dos están" if _close else "No todas están"} dentro
+      de ±2σ del objetivo (σ ≈ {_sd:.1%} con {len(kcal["test"])} platos).
+    - El intervalo **{_balanced}** reparte mejor la cobertura entre cuartiles de kcal
+      (diferencia entre el mejor y el peor cuartil de {_spread[_balanced]:.0%}, frente a
+      {_spread[_other]:.0%}). El peor cuartil del {_add} se queda en {_worst[_add][0]:.0%}
+      (cuartil {_worst[_add][1]}) y el del {_mul} en {_worst[_mul][0]:.0%} (cuartil {_worst[_mul][1]}).
+    - Siguientes pasos: conformal normalizado y CQR para adaptar el ancho a la dificultad de
+      cada plato, no solo a su tamaño; y fine-tuning del ViT.
+    """
+    )
 
 
 if __name__ == "__main__":

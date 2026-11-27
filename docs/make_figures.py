@@ -8,6 +8,7 @@ evidence behind the decisions in decisions.typ.
 """
 
 import json
+from itertools import pairwise
 from pathlib import Path
 
 import altair as alt
@@ -18,28 +19,36 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from conformal_calorie_estimation.baseline import (
+    RIDGE_ALPHAS,
+    fit_log_ridge,
+    group_labels,
+    mae,
+    prepare_baseline,
+)
 from conformal_calorie_estimation.conformal import (
-    absolute_residual_interval,
+    conformal_intervals,
     conformal_quantile,
     coverage,
+    coverage_by_group,
+    coverage_distribution,
+    quantile_groups,
+    resampled_coverage,
 )
 from conformal_calorie_estimation.data import (
-    clean_train,
     image_path,
     incremental_groups,
     official_splits,
-    read_dishes,
     read_ids,
-    split_by_groups,
 )
-from conformal_calorie_estimation.features import DEFAULT_MODEL, cached_features
+from conformal_calorie_estimation.features import DEFAULT_MODEL
 
 PROJECT = Path(__file__).resolve().parent.parent
 ROOT = PROJECT / "data" / "nutrition5k"
 FEATURES = PROJECT / "data" / "features"
 OUT = PROJECT / "docs" / "figures"
 SEED, ALPHA = 0, 0.1
-RIDGE_ALPHAS = [1, 10, 30, 100, 300, 1000, 3000, 10000]
+N_REPS = 1000
 BACKBONES = [  # (label, timm name, input size)
     ("DINOv2-S/14 @ 224", DEFAULT_MODEL, 224),
     ("DINOv3-S/16 @ 224", "vit_small_patch16_dinov3.lvd1689m", 224),
@@ -51,6 +60,7 @@ BLUE, ORANGE = "#1B6FA8", "#D4521F"
 INK, MUTED, GRID = "#111111", "#5B6270", "#E3E5E8"
 MUL, ADD = "multiplicative (log)", "additive (kcal)"
 VARIANTS = [MUL, ADD]
+LABELS = {"multiplicative": MUL, "additive": ADD}
 
 
 @alt.theme.register("docs", enable=True)
@@ -82,26 +92,10 @@ def thumbnail(dish_id: str, name: str, width: int = 480) -> None:
     img.save(OUT / f"{name}.jpg", quality=88)
 
 
-def mae(t, p) -> float:
-    return float(np.mean(np.abs(t - p)))
-
-
-def fit_baseline(X, y):
-    """Ridge on log1p(kcal), regularization chosen on val. Returns (model, alpha, val MAE)."""
-    best = None
-    for a in RIDGE_ALPHAS:
-        model = make_pipeline(StandardScaler(), Ridge(alpha=a)).fit(X["train"], np.log1p(y["train"]))
-        score = mae(y["val"], np.expm1(model.predict(X["val"])))
-        if best is None or score < best[2]:
-            best = (model, a, score)
-    return best
-
-
-def conformal_intervals(y, pred_log, pred, alpha):
-    """Both split conformal variants on test, in kcal: {variant: (lower, upper)}."""
-    lo, hi = absolute_residual_interval(np.log1p(y["calib"]), pred_log["calib"], pred_log["test"], alpha)
-    alo, ahi = absolute_residual_interval(y["calib"], pred["calib"], pred["test"], alpha)
-    return {MUL: (np.expm1(lo).clip(0), np.expm1(hi)), ADD: (alo.clip(0), ahi)}
+def test_intervals(y, pred_log, alpha):
+    """Both variants on test, keyed by their document labels."""
+    ints = conformal_intervals(y["calib"], pred_log["calib"], pred_log["test"], alpha)
+    return {LABELS[v]: lohi for v, lohi in ints.items()}
 
 
 def grouping_evidence(dishes) -> dict:
@@ -118,7 +112,7 @@ def grouping_evidence(dishes) -> dict:
     by_time = {}
     for gap in (60, 300, 1800):
         groups = [[ids[0]]]
-        for a, b in zip(ids, ids[1:]):
+        for a, b in pairwise(ids):
             if dishes[b].timestamp - dishes[a].timestamp < gap:
                 groups[-1].append(b)
             else:
@@ -129,16 +123,9 @@ def grouping_evidence(dishes) -> dict:
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    dishes = read_dishes(ROOT)
     official = official_splits(ROOT)
-    raw = split_by_groups(official["train"], dishes, {"val": 0.1, "calib": 0.2}, seed=SEED)
-    parts = {
-        "train": clean_train(raw["train"], dishes),
-        "val": raw["val"],
-        "calib": raw["calib"],
-        "test": official["test"],
-    }
-    removed = sorted(set(raw["train"]) - set(parts["train"]))
+    data = prepare_baseline(ROOT, FEATURES, seed=SEED)  # DINOv2, the chosen backbone
+    dishes, parts, removed, y = data.dishes, data.parts, data.removed, data.kcal
 
     # ------------------------------------------------------------------ EDA
     df = pl.DataFrame(
@@ -205,47 +192,43 @@ def main() -> None:
         thumbnail(dish_id, name)
 
     # ------------------------------------------------------------ baseline
-    y = {k: np.array([dishes[i].calories for i in ids]) for k, ids in parts.items()}
-    all_ids = official["train"] + official["test"]
     backbones = []
     for label, name, size in BACKBONES:
-        feats = cached_features(ROOT, all_ids, FEATURES, model_name=name, img_size=size)
-        X = {k: np.stack([feats[i] for i in ids]) for k, ids in parts.items()}
-        model, best_alpha, val_mae = fit_baseline(X, y)
-        pred_log = {k: model.predict(x) for k, x in X.items()}
-        pred = {k: np.expm1(p).clip(0) for k, p in pred_log.items()}
-        lo, hi = conformal_intervals(y, pred_log, pred, ALPHA)[MUL]
+        run = data if name == DEFAULT_MODEL else prepare_baseline(ROOT, FEATURES, seed=SEED, model_name=name, img_size=size)
+        fit = fit_log_ridge(run.X, run.kcal)
+        run_pred_log = {k: fit.model.predict(x) for k, x in run.X.items()}
+        lo, hi = test_intervals(run.kcal, run_pred_log, ALPHA)[MUL]
         backbones.append({
-            "label": label, "model": name, "img_size": size, "dim": int(X["train"].shape[1]),
-            "val_mae": val_mae, "test_mae": mae(y["test"], pred["test"]),
-            "coverage": coverage(y["test"], lo, hi),
+            "label": label, "model": name, "img_size": size, "dim": int(run.X["train"].shape[1]),
+            "val_mae": min(r["val_mae"] for r in fit.search),
+            "test_mae": mae(run.kcal["test"], np.expm1(run_pred_log["test"]).clip(0)),
+            "coverage": coverage(run.kcal["test"], lo, hi),
             "width_mean": float(np.mean(hi - lo)), "width_median": float(np.median(hi - lo)),
         })
-        if name == DEFAULT_MODEL:
-            main_run = (best_alpha, pred_log, pred)
-            raw_target_val_mae = min(  # same model, fitted on kcal instead of log1p(kcal)
-                mae(y["val"], make_pipeline(StandardScaler(), Ridge(alpha=a)).fit(X["train"], y["train"]).predict(X["val"]))
-                for a in RIDGE_ALPHAS
-            )
-    best_alpha, pred_log, pred = main_run
 
-    ints = conformal_intervals(y, pred_log, pred, ALPHA)
+    X = data.X
+    fit = fit_log_ridge(X, y)
+    best_alpha = fit.alpha
+    pred_log = {k: fit.model.predict(x) for k, x in X.items()}
+    pred = {k: np.expm1(p).clip(0) for k, p in pred_log.items()}
+    raw_target_val_mae = min(  # same embeddings, ridge fitted on kcal instead of log1p(kcal)
+        mae(y["val"], make_pipeline(StandardScaler(), Ridge(alpha=a)).fit(X["train"], y["train"]).predict(X["val"]))
+        for a in RIDGE_ALPHAS
+    )
+
+    ints = test_intervals(y, pred_log, ALPHA)
     yt = y["test"]
-    q_edges = np.quantile(yt, [0, 0.25, 0.5, 0.75, 1])
-    labels = [f"{a:.0f}–{b:.0f}" for a, b in zip(q_edges, q_edges[1:])]
-    bins = np.clip(np.searchsorted(q_edges, yt, side="right") - 1, 0, 3)
+    bins, labels = quantile_groups(yt, n=4)
     by_size = pl.DataFrame(
         [
-            {"variant": v, "quartile": labels[b], "order": b,
-             "coverage": coverage(yt[bins == b], lo[bins == b], hi[bins == b]),
-             "width": float(np.mean(hi[bins == b] - lo[bins == b]))}
+            {"variant": v, "quartile": labels[g], "order": g, "coverage": st["coverage"], "width": st["mean_width"]}
             for v, (lo, hi) in ints.items()
-            for b in range(4)
+            for g, st in coverage_by_group(yt, lo, hi, bins).items()
         ]
     )
     variant_colors = alt.Scale(domain=VARIANTS, range=[BLUE, ORANGE])
     x_q = alt.X("quartile:N", sort=labels, title="True kcal (test quartile)", axis=alt.Axis(labelAngle=0))
-    bar = dict(cornerRadiusTopLeft=3, cornerRadiusTopRight=3, width=alt.RelativeBandSize(0.8))
+    bar = {"cornerRadiusTopLeft": 3, "cornerRadiusTopRight": 3, "width": alt.RelativeBandSize(0.8)}
     cov_chart = (
         alt.Chart(by_size).mark_bar(**bar).encode(
             x=x_q, xOffset=alt.XOffset("variant:N", sort=VARIANTS),
@@ -267,7 +250,7 @@ def main() -> None:
         [
             {"target": round(1 - a, 2), "variant": v, "coverage": coverage(yt, lo, hi)}
             for a in np.round(np.arange(0.05, 0.55, 0.05), 2)
-            for v, (lo, hi) in conformal_intervals(y, pred_log, pred, float(a)).items()
+            for v, (lo, hi) in test_intervals(y, pred_log, float(a)).items()
         ]
     )
     diag = alt.Chart(pl.DataFrame({"x": [0.45, 0.95]})).mark_line(color=MUTED, strokeWidth=1).encode(x="x:Q", y="x:Q")
@@ -277,6 +260,47 @@ def main() -> None:
         color=alt.Color("variant:N", scale=variant_colors, title=None),
     )
     save((diag + lines).properties(width=300, height=260), "coverage_vs_alpha")
+
+    # What the guarantee promises: fixed model, random calibration/test re-splits.
+    pool = parts["calib"] + parts["test"]
+    pool_y = np.concatenate([y["calib"], y["test"]])
+    pool_pred = np.concatenate([pred_log["calib"], pred_log["test"]])
+    n_cal, n_pool_test = len(parts["calib"]), len(pool) - len(parts["calib"])
+    grid, pmf = coverage_distribution(n_cal, n_pool_test, ALPHA)
+    theory_mean = float(grid @ pmf)
+    theory_sd = float(np.sqrt(((grid - theory_mean) ** 2) @ pmf))
+    resampled = {
+        mode: resampled_coverage(pool_y, pool_pred, ALPHA, n_cal, N_REPS, groups=groups, seed=SEED)
+        for mode, groups in (("groups", group_labels(pool, dishes)), ("dishes", None))
+    }
+    bin_width = 0.005
+    edges_cov = np.arange(0.80, 1.0 + bin_width / 2, bin_width)
+    hist_rows = [
+        {"variant": LABELS[v], "lo": float(a), "hi": float(b), "density": c / (N_REPS * bin_width)}
+        for v, covs in resampled["groups"].items()
+        for a, b, c in zip(edges_cov, edges_cov[1:], np.histogram(covs, bins=edges_cov)[0])
+    ]
+    theory = pl.DataFrame({"coverage": grid, "density": pmf * n_pool_test}).filter(
+        (pl.col("coverage") >= 0.80) & (pl.col("coverage") <= 1.0)
+    )
+    panels = []
+    for label, color in ((MUL, BLUE), (ADD, ORANGE)):
+        panels.append(
+            (
+                alt.Chart(pl.DataFrame(hist_rows).filter(pl.col("variant") == label))
+                .mark_rect(color=color, opacity=0.75)
+                .encode(
+                    x=alt.X("lo:Q", title="Coverage measured on test", axis=alt.Axis(format="%"),
+                            scale=alt.Scale(domain=[0.82, 0.98])),
+                    x2="hi:Q",
+                    y=alt.Y("density:Q", title="Density"),
+                    y2=alt.datum(0),
+                )
+                + alt.Chart(theory).mark_line(color=INK, strokeWidth=2).encode(x="coverage:Q", y="density:Q")
+                + alt.Chart(pl.DataFrame({"x": [1 - ALPHA]})).mark_rule(color=MUTED, strokeWidth=1).encode(x="x:Q")
+            ).properties(width=250, height=180, title=label)
+        )
+    save(alt.hconcat(*panels, spacing=30), "coverage_resampled")
 
     lo, hi = ints[MUL]
     examples = []
@@ -308,10 +332,18 @@ def main() -> None:
         "cov_sd": float(np.sqrt(ALPHA * (1 - ALPHA) / len(yt))),
         "cov_sd_calib": float(np.sqrt(ALPHA * (1 - ALPHA) / len(parts["calib"]))),
         "backbones": backbones,
+        "resampling": {
+            "n_reps": N_REPS, "n_cal": n_cal, "n_test": n_pool_test,
+            "theory_mean": theory_mean, "theory_sd": theory_sd,
+            **{
+                mode: {LABELS[v]: {"mean": float(c.mean()), "sd": float(c.std())} for v, c in covs.items()}
+                for mode, covs in resampled.items()
+            },
+        },
         "examples": examples,
     }
     (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
-    print(json.dumps({k: metrics[k] for k in ("n", "eda", "grouping", "backbones")}, indent=1))
+    print(json.dumps({k: metrics[k] for k in ("n", "best_alpha", "mae", "coverage", "resampling")}, indent=1))
 
 
 if __name__ == "__main__":
