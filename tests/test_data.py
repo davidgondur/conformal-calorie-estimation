@@ -6,6 +6,7 @@ from PIL import Image
 
 from conformal_calorie_estimation.data import (
     Nutrition5kOverhead,
+    clean_train,
     incremental_groups,
     official_splits,
     parse_dish_row,
@@ -113,3 +114,13 @@ def test_dataset_returns_image_and_targets(root: Path):
 def test_dataset_rejects_unknown_target(root: Path):
     with pytest.raises(ValueError):
         Nutrition5kOverhead(root, [], targets=("sugar",))
+
+
+def test_clean_train_drops_only_wrong_labels():
+    rows = {
+        "ok": "dish_1,2.3,10,0,0.4,0.3,ingr_1,spinach (raw),10,2.3,0,0.4,0.3",
+        "plate": "dish_2,0,86,0,0,0,ingr_2,plate only,86,0,0,0,0",
+        "heavy": "dish_3,3943,3051,11,844,84,ingr_3,white rice,2991,3900,10,840,80",
+    }
+    dishes = {d.id: d for d in (parse_dish_row(r.split(",")) for r in rows.values())}
+    assert clean_train(list(dishes), dishes) == ["dish_1"]

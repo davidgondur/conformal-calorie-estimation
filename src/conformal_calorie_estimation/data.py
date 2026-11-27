@@ -162,6 +162,40 @@ def split_by_groups(
     return {name: sorted(ids) for name, ids in parts.items()}
 
 
+MAX_PLAUSIBLE_MASS_G = 2000.0
+
+
+def label_problem(dish: Dish) -> str | None:
+    """Why ``dish`` has an obviously wrong label, or None if it looks fine.
+
+    Rules (checked against the photos in notebooks/EDA.py):
+
+    - an empty "plate only" label or 0 kcal: food is visible in the photo;
+    - total mass above ``MAX_PLAUSIBLE_MASS_G``: the one case is a ~3 kg
+      rice entry for a small portion. The next heaviest dish is ~1.1 kg.
+
+    Very low calories are *not* a problem: they are real one-ingredient
+    plates (a few grams of spinach, cucumber...).
+    """
+    if dish.calories <= 0 or any(i.name == "plate only" for i in dish.ingredients):
+        return "empty plate label / 0 kcal"
+    if dish.mass > MAX_PLAUSIBLE_MASS_G:
+        return f"mass > {MAX_PLAUSIBLE_MASS_G:.0f} g"
+    return None
+
+
+def clean_train(dish_ids: Iterable[str], dishes: dict[str, Dish]) -> list[str]:
+    """Drop dishes with obviously wrong labels (see :func:`label_problem`).
+
+    Apply it only to the part used to fit model weights, after
+    :func:`split_by_groups`. Validation, calibration and test stay as they
+    are: calibration must look like test for the coverage guarantee to hold,
+    and removing hard cases from test would make the reported coverage
+    optimistic.
+    """
+    return [i for i in dish_ids if label_problem(dishes[i]) is None]
+
+
 class Nutrition5kOverhead(Dataset):
     """Overhead RGB photo -> nutrition targets.
 

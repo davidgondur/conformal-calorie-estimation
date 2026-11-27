@@ -57,6 +57,7 @@ Reglas:
 - **`test` nunca se subdivide** y solo se usa al final, para medir la cobertura.
 - **`calib` no puede influir en el modelo**, ni siquiera en el early stopping o en la elección de hiperparámetros: para eso está `val`. Si no, la garantía de cobertura conformal deja de valer.
 - `split_by_groups` reparte **grupos de montaje incremental** enteros, para que los pasos casi idénticos de un mismo plato no queden en dos particiones a la vez. Los grupos se detectan con una heurística: dos platos consecutivos, a menos de 5 minutos, en los que los ingredientes del primero son un subconjunto de los del segundo. La agrupación oficial no está publicada.
+- **Solo se limpia la parte de entrenamiento**, después de dividir: `clean_train(parts["train"], dishes)` quita las etiquetas claramente erróneas (platos *"plate only"* o de 0 kcal, y masas de más de 2 kg). `val`, `calib` y `test` no se limpian. Las calorías muy bajas no se quitan: son platos reales de un solo ingrediente.
 
 > Thames, Q. et al. *Nutrition5k: Towards Automatic Nutritional Understanding of Generic Food.* CVPR 2021.
 
