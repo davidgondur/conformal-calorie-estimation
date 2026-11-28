@@ -103,3 +103,24 @@ def test_warmup_cosine():
     assert warmup_cosine(0, 100, 10) == pytest.approx(0.1)
     assert warmup_cosine(10, 100, 10) == pytest.approx(1.0)
     assert warmup_cosine(100, 100, 10) == pytest.approx(0.0)
+
+
+def test_finetuned_outputs_assemble_honest_train_data_from_folds(root, tmp_path):
+    from conformal_calorie_estimation.finetune import finetuned_outputs
+
+    full = train(tiny(root, tmp_path, name="run", epochs=1))
+    with pytest.raises(FileNotFoundError):
+        finetuned_outputs(full)
+    assert finetuned_outputs(full, require_folds=False).honest_emb is None
+
+    for k in range(5):
+        train(tiny(root, tmp_path, name=f"run_fold{k}", epochs=1, fold=k))
+    out = finetuned_outputs(full)
+    n = len(out.parts["train"])
+    assert out.honest_emb.shape == (n, 192) and out.honest_residual.shape == (n,)
+    # The honest residual of each train dish comes from the fold run that left it out.
+    for k in range(5):
+        f = np.load(tmp_path / "models" / f"run_fold{k}" / "outputs.npz")
+        i = out.parts["train"].index(str(f["oof_ids"][0]))
+        expected = abs(np.log1p(out.kcal["train"][i]) - f["oof_pred"][0])
+        assert out.honest_residual[i] == pytest.approx(expected)

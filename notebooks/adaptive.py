@@ -14,8 +14,8 @@ def _():
     from scipy.stats import spearmanr
 
     from conformal_calorie_estimation.adaptive import (
-        VARIANTS,
         adaptive_intervals,
+        baseline_outputs,
         fit_difficulty,
         fit_quantiles,
         resampled_adaptive_coverage,
@@ -32,6 +32,7 @@ def _():
     return (
         Image,
         adaptive_intervals,
+        baseline_outputs,
         alt,
         coverage,
         coverage_by_group,
@@ -71,7 +72,7 @@ def _(mo):
 
 
 @app.cell
-def _(fit_log_ridge, mo, np, prepare_baseline):
+def _(baseline_outputs, fit_log_ridge, mo, np, prepare_baseline):
     ROOT = mo.notebook_dir().parent / "data" / "nutrition5k"
     FEATURES_DIR = mo.notebook_dir().parent / "data" / "features"
     SEED = 0
@@ -87,7 +88,9 @@ def _(fit_log_ridge, mo, np, prepare_baseline):
 
     data = prepare_baseline(ROOT, FEATURES_DIR, seed=SEED)
     ridge = fit_log_ridge(data.X, data.kcal)
-    pred_kcal_test = np.expm1(ridge.model.predict(data.X["test"])).clip(0)
+    # Predictions, embeddings and honest (cross-fitted) train residuals.
+    outputs = baseline_outputs(data, ridge, seed=SEED)
+    pred_kcal_test = np.expm1(outputs.pred_log["test"]).clip(0)
     return (
         ALPHAS,
         ROOT,
@@ -95,8 +98,8 @@ def _(fit_log_ridge, mo, np, prepare_baseline):
         VARIANT_COLORS,
         VARIANT_LABELS,
         data,
+        outputs,
         pred_kcal_test,
-        ridge,
     )
 
 
@@ -114,12 +117,12 @@ def _(mo):
 
 
 @app.cell
-def _(data, fit_difficulty, np, ridge, spearmanr):
-    difficulty = fit_difficulty(data, ridge, seed=0)
-    _val_residual = np.abs(np.log1p(data.kcal["val"]) - ridge.model.predict(data.X["val"]))
-    _sigma_val = difficulty.sigma(data.X["val"])
+def _(fit_difficulty, np, outputs, spearmanr):
+    difficulty = fit_difficulty(outputs)
+    _val_residual = np.abs(np.log1p(outputs.kcal["val"]) - outputs.pred_log["val"])
+    _sigma_val = difficulty.sigma(outputs.emb["val"])
     difficulty_rho = float(spearmanr(_sigma_val, _val_residual).statistic)
-    floored_share = float(np.mean(difficulty.sigma(data.X["test"]) <= difficulty.floor))
+    floored_share = float(np.mean(difficulty.sigma(outputs.emb["test"]) <= difficulty.floor))
     return difficulty, difficulty_rho, floored_share
 
 
@@ -154,9 +157,9 @@ def _(mo):
 
 
 @app.cell
-def _(ALPHAS, data, fit_quantiles, mo):
+def _(ALPHAS, fit_quantiles, mo, outputs):
     with mo.status.spinner(title="Ajustando los modelos de cuantiles para cada α..."):
-        quantile_fits = {round(_a, 2): fit_quantiles(data, _a) for _a in ALPHAS}
+        quantile_fits = {round(_a, 2): fit_quantiles(outputs, _a) for _a in ALPHAS}
     return (quantile_fits,)
 
 
@@ -170,9 +173,9 @@ def _(ALPHAS, mo):
 
 
 @app.cell
-def _(alpha_slider, data, mo, quantile_fits):
+def _(alpha_slider, mo, outputs, quantile_fits):
     qfit = quantile_fits[round(alpha_slider.value, 2)]
-    _crossed = {s: qfit.predict(data.X[s])[2] for s in ("calib", "test")}
+    _crossed = {s: qfit.predict(outputs.emb[s])[2] for s in ("calib", "test")}
     mo.md(
         f"Cuantiles {alpha_slider.value / 2:.3f} y {1 - alpha_slider.value / 2:.3f} · "
         f"L1 elegida: inferior {qfit.l1['lower']}, superior {qfit.l1['upper']} · "
@@ -197,14 +200,13 @@ def _(
     VARIANT_LABELS,
     adaptive_intervals,
     alpha_slider,
-    data,
     difficulty,
+    outputs,
     qfit,
-    ridge,
 ):
     test_intervals = {
         VARIANT_LABELS[_v]: _lohi
-        for _v, _lohi in adaptive_intervals(data, ridge, difficulty, qfit, alpha_slider.value).items()
+        for _v, _lohi in adaptive_intervals(outputs, difficulty, qfit, alpha_slider.value).items()
     }
     return (test_intervals,)
 
@@ -445,19 +447,18 @@ def _(
     SEED,
     VARIANT_LABELS,
     alpha_slider,
-    data,
     difficulty,
     mo,
     np,
+    outputs,
     pl,
     qfit,
     resampled_adaptive_coverage,
     respect_groups,
-    ridge,
     summary,
 ):
     resampled = resampled_adaptive_coverage(
-        data, ridge, difficulty, qfit, n_reps=1000, respect_groups=respect_groups.value, seed=SEED
+        outputs, difficulty, qfit, n_reps=1000, respect_groups=respect_groups.value, seed=SEED
     )
     _official = dict(zip(summary["variante"], summary["cobertura"]))
     resampled_table = pl.DataFrame(
@@ -521,11 +522,6 @@ def _(
       cobertura media en torno al objetivo; las diferencias en la partición oficial son en parte azar.
     """
     )
-
-
-@app.cell
-def _():
-    return
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ Estimación de las **calorías de un plato** a partir de una foto, con **interva
 
 ## Stack
 
-- **Modelo**: ViT pequeño (DeiT-tiny o DINOv2-small) con fine-tuning en PyTorch.
+- **Modelo**: DINOv2-small (ViT-S/14, vía `timm`) con fine-tuning en PyTorch.
 - **Exportación**: ONNX (fp32 e int8).
 - **Conformal**: calibración offline en Python (MAPIE / TorchCP / implementación propia).
 - **Web**: Quarto + Observable JS + `onnxruntime-web`, publicada en GitHub Pages.
@@ -63,7 +63,18 @@ Reglas:
 
 ## Estado
 
-En desarrollo.
+En desarrollo. Hecho hasta ahora:
+
+- Descarga, particiones y limpieza (`notebooks/EDA.py`).
+- Baseline con DINOv2 congelado + ridge e intervalos conformales aditivos y multiplicativos (`notebooks/baseline.py`).
+- Intervalos adaptativos: conformal normalizado y CQR (`notebooks/adaptive.py`).
+- Fine-tuning de DINOv2 y DINOv3 con las cuatro variantes conformales encima (`notebooks/finetune.py`):
+
+  ```bash
+  uv run python scripts/finetune_sweep.py all   # 33 entrenamientos, ~2 h en una GPU → models/
+  ```
+
+Pendiente: exportación a ONNX (fp32 e int8) y la demo web. Las decisiones y los resultados están en `docs/decisions.typ`.
 
 ## Licencia
 

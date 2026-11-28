@@ -31,7 +31,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 
-from .adaptive import group_kfold
+from .adaptive import PointModelOutputs, group_kfold
 from .baseline import DEFAULT_FRACTIONS, group_labels, make_parts
 from .data import Nutrition5kOverhead
 from .features import DEFAULT_MODEL
@@ -256,6 +256,73 @@ def train(cfg: FinetuneConfig) -> Path:
         arrays |= {f"{part}_ids": np.array(ids), f"{part}_pred": pred[:, 0], f"{part}_emb": emb}
     np.savez(out / "outputs.npz", **arrays)
     return out
+
+
+# --------------------------------------------------------------------------
+# Reading finished runs
+# --------------------------------------------------------------------------
+
+
+def load_config(run_dir: Path) -> FinetuneConfig:
+    return FinetuneConfig(**json.loads((Path(run_dir) / "config.json").read_text()))
+
+
+def run_summary(run_dir: Path) -> dict:
+    """Configuration, best epoch and best val MAE of a finished run, plus its history."""
+    run_dir = Path(run_dir)
+    o = np.load(run_dir / "outputs.npz")
+    with (run_dir / "history.csv").open() as f:
+        history = [{k: float(v) for k, v in row.items()} for row in csv.DictReader(f)]
+    return {
+        **asdict(load_config(run_dir)),
+        "best_epoch": int(o["best_epoch"]),
+        "best_val_mae": float(o["best_val_mae"]),
+        "history": history,
+    }
+
+
+def finetuned_outputs(run_dir: Path, require_folds: bool = True) -> PointModelOutputs:
+    """A finished run as :class:`PointModelOutputs`, ready for the conformal variants.
+
+    Predictions and embeddings come from the final model. The honest train
+    residuals and embeddings come from the grouped-fold runs
+    ``<name>_fold<k>`` next to it: each predicted the fold it never saw.
+    Without them (``require_folds=False``) the honest fields are left empty
+    and only the additive and multiplicative variants can be computed.
+    """
+    run_dir = Path(run_dir)
+    cfg = load_config(run_dir)
+    dishes, parts, _ = make_parts(Path(cfg.root), seed=cfg.split_seed, fractions=DEFAULT_FRACTIONS)
+    o = np.load(run_dir / "outputs.npz")
+    for part, ids in parts.items():
+        if o[f"{part}_ids"].tolist() != ids:
+            raise ValueError(f"{run_dir}: saved {part} ids do not match the project partitions")
+    kcal = {p: np.array([dishes[i].calories for i in ids]) for p, ids in parts.items()}
+
+    fold_dirs = [run_dir.parent / f"{cfg.name}_fold{k}" for k in range(cfg.n_folds)]
+    honest_residual = honest_emb = None
+    if all((d / "outputs.npz").exists() for d in fold_dirs):
+        pred, emb = {}, {}
+        for d in fold_dirs:
+            f = np.load(d / "outputs.npz")
+            for i, dish_id in enumerate(f["oof_ids"].tolist()):
+                pred[dish_id], emb[dish_id] = f["oof_pred"][i], f["oof_emb"][i]
+        if set(pred) != set(parts["train"]):
+            raise ValueError(f"{run_dir}: fold runs do not cover train exactly once")
+        honest_emb = np.stack([emb[i] for i in parts["train"]])
+        honest_residual = np.abs(np.log1p(kcal["train"]) - np.array([pred[i] for i in parts["train"]]))
+    elif require_folds:
+        raise FileNotFoundError(f"{run_dir}: missing fold runs {[d.name for d in fold_dirs]}")
+
+    return PointModelOutputs(
+        dishes=dishes,
+        parts=parts,
+        kcal=kcal,
+        pred_log={p: o[f"{p}_pred"] for p in parts},
+        emb={p: o[f"{p}_emb"] for p in parts},
+        honest_residual=honest_residual,
+        honest_emb=honest_emb,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

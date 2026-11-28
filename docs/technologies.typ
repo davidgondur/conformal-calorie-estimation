@@ -4,7 +4,7 @@
 
 = Introduction <sec:intro>
 
-This document explains, one by one, the technologies that the project *actually uses so far*, and how each one fits in. It is meant to be read by someone who knows Python and basic machine learning but has not necessarily met these particular tools. Technologies that are planned but not yet used (fine-tuning, ONNX export, the web demo) are left out; they will be added when they enter the code.
+This document explains, one by one, the technologies that the project *actually uses so far*, and how each one fits in. It is meant to be read by someone who knows Python and basic machine learning but has not necessarily met these particular tools. Technologies that are planned but not yet used (ONNX export, the web demo) are left out; they will be added when they enter the code.
 
 The reasons for each choice are recorded in the companion document, _Decision log_. Here the focus is on *how things work*.
 
@@ -159,7 +159,7 @@ The result is a general-purpose image representation: images with similar conten
 
 A pretrained network used without changing its weights is called a *frozen backbone*. Its embeddings are computed once for every photo (about 12 seconds for 3,262 photos on the GPU) and stored in `data/features/`. Any number of cheap models can then be fitted on top of them in seconds. Fitting a linear model on frozen features is known as a *linear probe*, and it is the standard way to measure how much useful information a representation already contains.
 
-The alternative, *fine-tuning*, updates the backbone's weights on the target task. It usually performs better but costs a full training run, so it comes later in the project.
+The alternative, *fine-tuning*, updates the backbone's weights on the target task. It usually performs better but costs a full training run; @sec:finetune explains how it is done here.
 
 = Point prediction with ridge regression <sec:regression>
 
@@ -345,6 +345,51 @@ Both adaptive variants improve on the baseline intervals (@tab:adaptive, @fig:ad
   image("figures/adaptive_by_predicted.svg", width: 100%),
   caption: [Coverage and mean width of the four variants per quartile of predicted kcal in test ($alpha = #num(m.alpha)$).],
 ) <fig:adaptive>
+
+= Fine-tuning a Vision Transformer <sec:finetune>
+
+Fine-tuning continues training a pretrained network on the target task. Here the DINOv2 backbone gets a new *head*, a linear layer from the 384-dimensional embedding to one number, $log(1 + "kcal")$, and the whole network is trained on the photos of `train`. The training loop is plain PyTorch (`finetune.py`); each run takes about three and a half minutes on the GPU.
+
+== The loss: L1 on the log scale
+
+The network minimizes the mean absolute error between its output and $log(1 + "kcal")$. Absolute error (L1) is minimized by the *median*, so a few wrong labels pull the model much less than with squared error. Combined with the log scale, the model learns relative errors, as the baseline ridge did.
+
+== AdamW, warm-up and cosine decay
+
+*AdamW* is the standard optimizer for Transformers. It adapts the step size of every weight to the history of its gradients, and applies *weight decay* (a pull of every weight towards zero, like the ridge penalty) separately from that adaptation. Biases, normalization parameters and position embeddings are exempt from decay.
+
+The learning rate follows a schedule: it grows linearly from zero during the first two epochs (*warm-up*), so the randomly initialized head does not send large, noisy gradients into the pretrained backbone, and then decreases along a half cosine to zero at the last epoch, so training settles into a minimum.
+
+== Layer-wise learning-rate decay
+
+The layers of a pretrained ViT are not equally specific. Early blocks compute generic features (edges, textures) that transfer to any task; late blocks compute features closer to the pretraining objective. Fine-tuning therefore changes early blocks less: block $i$ of $L$ gets the rate
+
+$ "lr"_i = "lr"_"backbone" dot gamma^(L - 1 - i) , $
+
+with $gamma = 0.75$, so the first of the 12 blocks moves about 25 times less than the last. The new head, which starts from random weights, gets a much larger rate. A cheaper alternative is to freeze the early blocks entirely and train only the last few; both options were compared.
+
+== Augmentation without zoom
+
+*Data augmentation* shows the network modified copies of the training photos so it learns what does not matter. For an overhead photo, the orientation does not matter: there is no "up". Each training image is therefore rotated by a random multiple of 90°, flipped at random, and given slight changes of brightness, contrast and saturation.
+
+The usual augmentation for image classification, a random crop that is then enlarged (*random resized crop*), is deliberately left out. Zooming changes the *apparent amount* of food, which is exactly what determines the calories, and would teach the network that the same plate can look bigger or smaller.
+
+== Mixed precision
+
+The forward and backward passes run in *bfloat16*, a 16-bit floating-point format with the same range as 32-bit floats but less precision. Matrix multiplications are roughly twice as fast and use half the memory, and the reduced precision does not hurt training. Weights and the optimizer state stay in 32 bits.
+
+== Choosing the epoch and the recipe
+
+Every run trains for 40 epochs and keeps the weights of the epoch with the lowest mean absolute error in kcal on `val`. The recipe (backbone learning rate, how many blocks to train, and whether to also predict mass and macronutrients as extra outputs, *multi-task learning*) is chosen the same way, by comparing the best `val` error of a small grid of runs. `calib` and `test` play no part.
+
+== Honest residuals for the adaptive intervals
+
+The adaptive variants need residuals and embeddings of `train` dishes as if they were new (@sec:adaptive). With a frozen backbone, re-fitting the ridge by cross-validation was enough. A fine-tuned backbone has itself seen the labels of `train`, so its embeddings of those dishes are also optimistic. The whole fine-tuning is therefore repeated five times, each time leaving out one fold of `train` (by incremental groups), and each run predicts the fold it did not see. The difficulty and quantile models are trained on those out-of-fold residuals and embeddings, and then applied to the embeddings of the final model.
+
+== What fine-tuning changed
+
+#let ft = m.finetune
+With the chosen recipe (backbone learning rate #ft.best_recipe_lr, all blocks trained, calories only), the test error falls from #num(ft.point.frozen.test, d: 0) kcal with the frozen backbone to #num(ft.point.dinov2.test.mean, d: 0) ± #num(ft.point.dinov2.test.sd, d: 0) kcal over three seeds. Because conformal intervals are built from the model's errors, a better model gives narrower intervals at the same coverage: the median width of the normalized intervals drops from #num(ft.variants_frozen.at("normalized (log)").width_median, d: 0) to #num(ft.variants_finetuned.at("normalized (log)").width_median.mean, d: 0) kcal, while the coverage stays near 90%. The decision log has the full comparison.
 
 = Analysis tools <sec:analysis>
 

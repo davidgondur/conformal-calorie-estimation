@@ -48,6 +48,9 @@ All numbers come from `docs/figures/metrics.json`, which `uv run python docs/mak
     [D17], [Ridge difficulty model with a floor], [@sec:adaptive],
     [D18], [Linear CQR with one shared correction], [@sec:adaptive],
     [D19], [Interval score and coverage by group to compare variants], [@sec:adaptive],
+    [D20], [Recipe chosen by a small grid on `val`], [@sec:finetune],
+    [D21], [Fold runs give the adaptive variants honest training data], [@sec:finetune],
+    [D22], [Fine-tuned DINOv2 as the model to export], [@sec:finetune],
   ),
   caption: [Summary of decisions.],
 )
@@ -190,6 +193,7 @@ All numbers come from `docs/figures/metrics.json`, which `uv run python docs/mak
     - DINOv2 was the original plan and DINOv3 does not improve on it for this baseline (@tab:backbones). On `val`, which is where the choice must be made, they are tied.
     - DINOv2 weights are released under Apache 2.0. DINOv3 has its own Meta license, which would have to be reviewed before publishing the model in a public web demo.
     - In DINOv3's favour: with 16-pixel patches a 224-pixel image is 196 tokens instead of 256, so browser inference would be somewhat faster.
+    - Fine-tuning widened the gap in DINOv2's favour (@tab:finetune-point, D22).
   ],
   evidence: [
     #figure(
@@ -326,6 +330,81 @@ The baseline intervals widen only with the *size* of the predicted dish. Two var
   caption: [Coverage and mean interval width of the four variants per quartile of predicted kcal in test. The horizontal line marks the 90% target.],
 ) <fig:adaptive>
 
+= Fine-tuning <sec:finetune>
+
+#let ft = m.finetune
+#let fv(v) = ft.variants_finetuned.at(v)
+#let fz(v) = ft.variants_frozen.at(v)
+#let pm(x, d: 0) = num(x.mean, d: d) + " ± " + num(x.sd, d: d)
+
+The frozen backbone was the main limit of the baseline. The DINOv2 ViT-S/14 was then fine-tuned end to end on the photos of `train` (`finetune.py`, `scripts/finetune_sweep.py`), and the same four conformal variants were rebuilt on top of it. The analysis is in `notebooks/finetune.py`; the fine-tuning section of the technology guide explains the training loop.
+
+#figure(
+  table(
+    columns: (1fr, auto, auto),
+    align: (left, right, right),
+    table.header[Model][val MAE (kcal)][test MAE (kcal)],
+    [Frozen DINOv2 + ridge], num(ft.point.frozen.val), num(ft.point.frozen.test),
+    [Fine-tuned DINOv2 (3 seeds)], pm(ft.point.dinov2.val, d: 1), pm(ft.point.dinov2.test, d: 1),
+    [Fine-tuned DINOv3 (3 seeds)], pm(ft.point.dinov3.val, d: 1), pm(ft.point.dinov3.test, d: 1),
+  ),
+  caption: [Point error of the frozen baseline and of the chosen fine-tuning recipe on each backbone (mean ± standard deviation over seeds).],
+) <tab:finetune-point>
+
+#decision("D20", [Recipe chosen by a small grid on `val`],
+  chosen: [Twelve single-seed runs: backbone learning rate in {5e-6, 1e-5, 3e-5} × training all blocks or only the last four × predicting calories only or also mass and macronutrients (multi-task). Everything else is fixed: L1 loss on $log(1 + "kcal")$, AdamW with weight decay 0.05, layer-wise decay 0.75, head learning rate 1e-3, 2 warm-up epochs then cosine, 40 epochs, augmentation by 90° rotations, flips and mild colour jitter. Each run keeps its epoch with the lowest `val` MAE; the recipe with the lowest `val` MAE wins.],
+  alternatives: [A larger random or Bayesian search; tuning on a held-out part of `calib`; random resized crops.],
+  why: [
+    - Three questions matter most for a small dataset: how fast to move the backbone, how much of it to move and whether extra targets help. A full grid over them fits in about 45 minutes of GPU time.
+    - `val` is the only partition for choices (D5); `calib` must stay independent of the model.
+    - Zoom changes the apparent amount of food, which is what the model must measure, so random resized crops are left out.
+  ],
+  evidence: [
+    The winner is *#ft.best_recipe* (val MAE #num(ft.search.first().val_mae)). The learning rate dominates: all four runs at the highest rate beat every run at the lower rates. Training all blocks beat training the last four in every pair. Multi-task learning helped at the two lower rates but not at the highest, so the winner predicts calories only (@fig:finetune-search).
+  ],
+  consequences: [The best learning rate is the largest one tried (#ft.max_search_lr), so the optimum may lie above the grid. A follow-up grid at 5e-5 and 1e-4 is the cheapest possible improvement.],
+)
+
+#figure(
+  image("figures/finetune_search.svg", width: 75%),
+  caption: [`val` MAE per epoch of the twelve recipe-search runs. The chosen recipe is in blue.],
+) <fig:finetune-search>
+
+#decision("D21", [Fold runs give the adaptive variants honest training data],
+  chosen: [For each seed of the final recipe, train five more networks, each leaving out one grouped fold of `train` and predicting it. The difficulty and quantile models are trained on these out-of-fold embeddings and residuals, and applied to the embeddings of the full model.],
+  alternatives: [Training them on the full model's own `train` residuals; training them on `val`; using only the two non-adaptive variants.],
+  why: [A fine-tuned network has seen the labels of `train`, so both its residuals and its embeddings of those dishes are optimistic, just as the ridge's were (D16). Fold runs are the same cross-fitting idea applied to the whole network. They cost five extra runs per seed but keep `val` for choices and `calib` untouched.],
+  evidence: [The difficulty model learned this way still ranks the final model's `val` dishes, and better than with the frozen backbone: Spearman correlation between #num(ft.spearman_finetuned.min, d: 2) and #num(ft.spearman_finetuned.max, d: 2) across seeds, against #num(m.adaptive.difficulty.spearman_val, d: 2) before.],
+)
+
+#decision("D22", [Fine-tuned DINOv2 as the model to export],
+  chosen: [Export the fine-tuned DINOv2 with the seed that has the lowest `val` MAE (seed #ft.export_seed), with normalized conformal intervals.],
+  alternatives: [The frozen baseline; fine-tuned DINOv3 ViT-S/16; an ensemble of the three seeds.],
+  why: [
+    - Fine-tuning cuts the test error by about a third (@tab:finetune-point).
+    - With the recipe tuned for DINOv2, DINOv3 is clearly worse. A recipe tuned for DINOv3 might close the gap, but that is a separate search; the choice of D10 stands.
+    - An ensemble would triple the size and latency of the browser demo for a small gain.
+    - Normalized conformal has the lowest interval score after fine-tuning, as before it (@tab:finetune-variants, @fig:finetune-variants). The guarantee holds: over #thousands(m.resampling.n_reps) re-splits of `calib` + `test`, its mean coverage is #pct(ft.resampled_export.at(NORM).mean) ± #pct(ft.resampled_export.at(NORM).sd).
+  ],
+)
+
+#figure(
+  table(
+    columns: (1fr, auto, auto, auto, auto),
+    align: (left, right, right, right, right),
+    table.header[Variant][Coverage][Median width][Interval score][Frozen interval score],
+    ..(ADD, MUL, NORM, CQRL).map(v => (
+      v, pct(fv(v).coverage.mean), pm(fv(v).width_median), pm(fv(v).interval_score), num(fz(v).interval_score, d: 0),
+    )).flatten(),
+  ),
+  caption: [The four variants on top of the fine-tuned DINOv2, $alpha = #num(m.alpha)$, mean ± standard deviation over 3 seeds. Widths in kcal. The last column repeats the frozen baseline (@tab:adaptive).],
+) <tab:finetune-variants>
+
+#figure(
+  image("figures/finetune_variants.svg", width: 100%),
+  caption: [Interval score and median width on test of each variant, frozen baseline against fine-tuned DINOv2 (mean of 3 seeds). Lower is better in both panels.],
+) <fig:finetune-variants>
+
 = Tooling and documentation <sec:tooling>
 
 #decision("D13", [marimo, Polars and Altair for analysis],
@@ -349,7 +428,7 @@ The baseline intervals widen only with the *size* of the predicted dish. Two var
 
 + *Grouping.* Is there a better signal than ingredients and timestamps for the official incremental groups?
 + *Difficulty model.* Can a better $hat(sigma)$ (for example $k$-nearest neighbours in embedding space) make normalized conformal clearly better than CQR?
-+ *Fine-tuning.* Does a fine-tuned ViT beat the frozen baseline, and does DINOv3 overtake DINOv2 once fine-tuned?
++ *Fine-tuning.* Does a learning rate above #ft.max_search_lr improve the recipe further, and would a recipe tuned for DINOv3 overtake DINOv2?
 + *Quantization.* Does exporting the model to int8 ONNX break coverage, or only widen the intervals?
 
 #pagebreak()

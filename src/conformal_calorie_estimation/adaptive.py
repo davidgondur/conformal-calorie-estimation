@@ -15,10 +15,13 @@ from sklearn.preprocessing import StandardScaler
 from .baseline import BaselineData, RidgeFit, group_labels
 from .conformal import (
     conformal_intervals,
+    coverage,
     cqr_interval,
+    interval_score,
     normalized_interval,
     resampled_coverage_of,
 )
+from .data import Dish
 
 DIFFICULTY_ALPHAS = (1, 10, 100, 1000, 10000, 100000)
 QUANTILE_L1 = (0.001, 0.003, 0.01)
@@ -66,6 +69,53 @@ def cross_fitted_residuals(X: np.ndarray, kcal: np.ndarray, folds: np.ndarray, r
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# What any point model must provide
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PointModelOutputs:
+    """Everything the four conformal variants need from a point model on log1p(kcal).
+
+    ``pred_log`` and ``emb`` come from the final model for every partition.
+    ``honest_residual`` and ``honest_emb`` describe ``train`` dishes as if they
+    were new (out-of-fold), and are what the difficulty and quantile models
+    are trained on.
+    """
+
+    dishes: dict[str, Dish]
+    parts: dict[str, list[str]]
+    kcal: dict[str, np.ndarray]
+    pred_log: dict[str, np.ndarray]
+    emb: dict[str, np.ndarray]
+    honest_residual: np.ndarray | None  # |log1p(kcal) - prediction| on train, out of fold
+    honest_emb: np.ndarray | None  # embeddings of train matching those residuals
+
+
+def baseline_outputs(data: BaselineData, ridge: RidgeFit, k: int = 5, seed: int = 0) -> PointModelOutputs:
+    """Outputs of the frozen-backbone ridge baseline.
+
+    The frozen embeddings never saw a label, so they are honest as they are;
+    only the ridge residuals of ``train`` need grouped cross-fitting.
+    """
+    folds = group_kfold(group_labels(data.parts["train"], data.dishes), k=k, seed=seed)
+    return PointModelOutputs(
+        dishes=data.dishes,
+        parts=data.parts,
+        kcal=data.kcal,
+        pred_log={p: ridge.model.predict(x) for p, x in data.X.items()},
+        emb=data.X,
+        honest_residual=cross_fitted_residuals(data.X["train"], data.kcal["train"], folds, ridge.alpha),
+        honest_emb=data.X["train"],
+    )
+
+
+# --------------------------------------------------------------------------
+# Difficulty model for normalized conformal
+# --------------------------------------------------------------------------
+
+
 @dataclass
 class DifficultyFit:
     model: Pipeline  # predicts log(|residual| + eps)
@@ -78,32 +128,27 @@ class DifficultyFit:
         return np.maximum(np.exp(self.model.predict(X)), self.floor)
 
 
-def fit_difficulty(
-    data: BaselineData,
-    ridge: RidgeFit,
-    k: int = 5,
-    seed: int = 0,
-    alphas: Sequence[float] = DIFFICULTY_ALPHAS,
-) -> DifficultyFit:
-    """Ridge on the embeddings predicting log|residual| of the baseline.
+def val_residual(out: PointModelOutputs) -> np.ndarray:
+    """Absolute log residual of the final model on ``val`` (it never saw those dishes)."""
+    return np.abs(np.log1p(out.kcal["val"]) - out.pred_log["val"])
 
-    Trained on cross-fitted residuals of ``train`` (grouped folds), so the
-    targets are as honest as residuals on new dishes. Regularization is
-    chosen by squared error on ``val``, whose residuals come from the final
-    baseline ridge, which never saw those dishes.
+
+def fit_difficulty(out: PointModelOutputs, alphas: Sequence[float] = DIFFICULTY_ALPHAS) -> DifficultyFit:
+    """Ridge on the embeddings predicting log|residual| of the point model.
+
+    Trained on the honest (out-of-fold) residuals of ``train``. Regularization
+    is chosen by squared error on ``val``.
     """
-    X, kcal = data.X, data.kcal
-    folds = group_kfold(group_labels(data.parts["train"], data.dishes), k=k, seed=seed)
-    target = np.log(cross_fitted_residuals(X["train"], kcal["train"], folds, ridge.alpha) + _EPS)
-    val_target = np.log(np.abs(np.log1p(kcal["val"]) - ridge.model.predict(X["val"])) + _EPS)
+    target = np.log(out.honest_residual + _EPS)
+    val_target = np.log(val_residual(out) + _EPS)
 
     def fit(a):
-        return make_pipeline(StandardScaler(), Ridge(alpha=a)).fit(X["train"], target)
+        return make_pipeline(StandardScaler(), Ridge(alpha=a)).fit(out.honest_emb, target)
 
-    search = [{"alpha": a, "val_mse": float(np.mean((fit(a).predict(X["val"]) - val_target) ** 2))} for a in alphas]
+    search = [{"alpha": a, "val_mse": float(np.mean((fit(a).predict(out.emb["val"]) - val_target) ** 2))} for a in alphas]
     best = min(search, key=lambda r: r["val_mse"])["alpha"]
     model = fit(best)
-    floor = float(np.percentile(np.exp(model.predict(X["train"])), SIGMA_FLOOR_PERCENTILE))
+    floor = float(np.percentile(np.exp(model.predict(out.honest_emb)), SIGMA_FLOOR_PERCENTILE))
     return DifficultyFit(model=model, alpha=best, floor=floor, search=search)
 
 
@@ -133,21 +178,20 @@ class QuantileFit:
         return np.minimum(lo, hi), np.maximum(lo, hi), crossed
 
 
-def fit_quantiles(
-    data: BaselineData, alpha: float, l1_values: Sequence[float] = QUANTILE_L1
-) -> QuantileFit:
+def fit_quantiles(out: PointModelOutputs, alpha: float, l1_values: Sequence[float] = QUANTILE_L1) -> QuantileFit:
     """Linear quantile regression for the alpha/2 and 1 - alpha/2 quantiles of log1p(kcal).
 
-    The L1 penalty of each side is chosen by pinball loss on ``val``.
+    Trained on the honest embeddings of ``train``; the L1 penalty of each side
+    is chosen by pinball loss on ``val``.
     """
-    X, y = data.X, {k: np.log1p(v) for k, v in data.kcal.items()}
+    y_train, y_val = np.log1p(out.kcal["train"]), np.log1p(out.kcal["val"])
     chosen, models, search = {}, {}, []
     for side, q in (("lower", alpha / 2), ("upper", 1 - alpha / 2)):
         best = None
         for l1 in l1_values:
             model = make_pipeline(StandardScaler(), QuantileRegressor(quantile=q, alpha=l1, solver="highs"))
-            model.fit(X["train"], y["train"])
-            loss = pinball_loss(y["val"], model.predict(X["val"]), q)
+            model.fit(out.honest_emb, y_train)
+            loss = pinball_loss(y_val, model.predict(out.emb["val"]), q)
             search.append({"side": side, "l1": l1, "val_pinball": loss})
             if best is None or loss < best[0]:
                 best = (loss, l1, model)
@@ -160,9 +204,15 @@ def fit_quantiles(
 # --------------------------------------------------------------------------
 
 
+def _four_variants(y_cal, pred_cal, pred, sigma_cal, sigma, q_cal, q, alpha):
+    out = conformal_intervals(y_cal, pred_cal, pred, alpha)
+    out["normalized"] = normalized_interval(y_cal, pred_cal, sigma_cal, pred, sigma, alpha)
+    out["cqr"] = cqr_interval(y_cal, *q_cal, *q, alpha)
+    return {v: out[v] for v in VARIANTS}
+
+
 def adaptive_intervals(
-    data: BaselineData,
-    ridge: RidgeFit,
+    out: PointModelOutputs,
     difficulty: DifficultyFit,
     quantiles: QuantileFit,
     alpha: float,
@@ -174,21 +224,16 @@ def adaptive_intervals(
     """
     if not np.isclose(quantiles.alpha, alpha):
         raise ValueError(f"quantile models target alpha={quantiles.alpha}, not {alpha}")
-    X, y_cal = data.X, data.kcal["calib"]
-    pred_cal, pred = ridge.model.predict(X["calib"]), ridge.model.predict(X[split])
-    out = conformal_intervals(y_cal, pred_cal, pred, alpha)
-    out["normalized"] = normalized_interval(
-        y_cal, pred_cal, difficulty.sigma(X["calib"]), pred, difficulty.sigma(X[split]), alpha
+    e = out.emb
+    return _four_variants(
+        out.kcal["calib"], out.pred_log["calib"], out.pred_log[split],
+        difficulty.sigma(e["calib"]), difficulty.sigma(e[split]),
+        quantiles.predict(e["calib"])[:2], quantiles.predict(e[split])[:2], alpha,
     )
-    lo_cal, hi_cal, _ = quantiles.predict(X["calib"])
-    lo, hi, _ = quantiles.predict(X[split])
-    out["cqr"] = cqr_interval(y_cal, lo_cal, hi_cal, lo, hi, alpha)
-    return {v: out[v] for v in VARIANTS}
 
 
 def resampled_adaptive_coverage(
-    data: BaselineData,
-    ridge: RidgeFit,
+    out: PointModelOutputs,
     difficulty: DifficultyFit,
     quantiles: QuantileFit,
     n_reps: int = 1000,
@@ -200,18 +245,32 @@ def resampled_adaptive_coverage(
     All models stay fixed; only which dishes calibrate and which are tested
     changes. Calibration keeps the size of ``calib``.
     """
-    pool = data.parts["calib"] + data.parts["test"]
-    X = np.concatenate([data.X["calib"], data.X["test"]])
-    y = np.concatenate([data.kcal["calib"], data.kcal["test"]])
-    pred, sigma = ridge.model.predict(X), difficulty.sigma(X)
-    lo, hi, _ = quantiles.predict(X)
+    pool = out.parts["calib"] + out.parts["test"]
+    E = np.concatenate([out.emb["calib"], out.emb["test"]])
+    y = np.concatenate([out.kcal["calib"], out.kcal["test"]])
+    pred = np.concatenate([out.pred_log["calib"], out.pred_log["test"]])
+    sigma = difficulty.sigma(E)
+    lo, hi, _ = quantiles.predict(E)
     alpha = quantiles.alpha
 
     def intervals(cal):
-        out = conformal_intervals(y[cal], pred[cal], pred[~cal], alpha)
-        out["normalized"] = normalized_interval(y[cal], pred[cal], sigma[cal], pred[~cal], sigma[~cal], alpha)
-        out["cqr"] = cqr_interval(y[cal], lo[cal], hi[cal], lo[~cal], hi[~cal], alpha)
-        return {v: out[v] for v in VARIANTS}
+        return _four_variants(
+            y[cal], pred[cal], pred[~cal], sigma[cal], sigma[~cal],
+            (lo[cal], hi[cal]), (lo[~cal], hi[~cal]), alpha,
+        )
 
-    groups = group_labels(pool, data.dishes) if respect_groups else None
-    return resampled_coverage_of(y, intervals, len(data.parts["calib"]), n_reps, groups, seed)
+    groups = group_labels(pool, out.dishes) if respect_groups else None
+    return resampled_coverage_of(y, intervals, len(out.parts["calib"]), n_reps, groups, seed)
+
+
+def variant_metrics(intervals: dict[str, tuple[np.ndarray, np.ndarray]], y: np.ndarray, alpha: float) -> dict[str, dict]:
+    """Coverage, mean and median width, and interval score of each variant."""
+    return {
+        v: {
+            "coverage": coverage(y, lo, hi),
+            "width_mean": float(np.mean(hi - lo)),
+            "width_median": float(np.median(hi - lo)),
+            "interval_score": interval_score(y, lo, hi, alpha),
+        }
+        for v, (lo, hi) in intervals.items()
+    }

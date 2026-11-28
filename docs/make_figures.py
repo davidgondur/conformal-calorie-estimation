@@ -23,6 +23,7 @@ from sklearn.preprocessing import StandardScaler
 
 from conformal_calorie_estimation.adaptive import (
     adaptive_intervals,
+    baseline_outputs,
     fit_difficulty,
     fit_quantiles,
     pinball_loss,
@@ -52,11 +53,14 @@ from conformal_calorie_estimation.data import (
     read_ids,
 )
 from conformal_calorie_estimation.features import DEFAULT_MODEL
+from conformal_calorie_estimation.finetune import finetuned_outputs, run_summary
 
 PROJECT = Path(__file__).resolve().parent.parent
 ROOT = PROJECT / "data" / "nutrition5k"
 FEATURES = PROJECT / "data" / "features"
 OUT = PROJECT / "docs" / "figures"
+MODELS = PROJECT / "models"
+SEEDS = (0, 1, 2)
 SEED, ALPHA = 0, 0.1
 N_REPS = 1000
 BACKBONES = [  # (label, timm name, input size)
@@ -133,6 +137,126 @@ def grouping_evidence(dishes) -> dict:
                 groups.append([b])
         by_time[str(gap)] = summary(groups)
     return {"subset_rule": summary(incremental_groups(dishes[i] for i in ids)), "time_only": by_time}
+
+
+def kcal_mae(out, part: str) -> float:
+    return mae(out.kcal[part], np.expm1(out.pred_log[part]).clip(0))
+
+
+def mean_sd(values) -> dict:
+    a = np.asarray(values, dtype=float)
+    return {"mean": float(a.mean()), "sd": float(a.std(ddof=1)) if len(a) > 1 else 0.0}
+
+
+def finetune_section(frozen, frozen_difficulty, frozen_quantiles) -> dict:
+    """Fine-tuning results of scripts/finetune_sweep.py, as in notebooks/finetune.py."""
+    search = []
+    for d in sorted(MODELS.glob("search_*")):
+        r = run_summary(d)
+        search.append({
+            "name": r["name"], "lr": r["lr_backbone"], "all_blocks": r["train_last_blocks"] is None,
+            "multitask": r["multitask"], "val_mae": r["best_val_mae"], "best_epoch": r["best_epoch"],
+            "history": [h["val_mae"] for h in r["history"]],
+        })
+    search.sort(key=lambda r: r["val_mae"])
+    best = search[0]["name"]
+
+    curves = pl.DataFrame([
+        {"run": r["name"], "epoch": e, "val_mae": v, "best": r["name"] == best}
+        for r in search for e, v in enumerate(r["history"])
+    ])
+    chart = (
+        alt.Chart(curves).mark_line(strokeWidth=1.4).encode(
+            x=alt.X("epoch:Q", title="Epoch"),
+            y=alt.Y("val_mae:Q", scale=alt.Scale(domain=[45, 110], clamp=True), title="val MAE (kcal)"),
+            color=alt.condition(alt.datum.best, alt.value(BLUE), alt.value("#C9CED6")),
+            detail="run:N", order=alt.Order("best:N"),
+        ).properties(width=420, height=230)
+    )
+    save(chart, "finetune_search")
+
+    runs = {
+        "dinov2": {s: finetuned_outputs(MODELS / f"dinov2_s{s}") for s in SEEDS},
+        "dinov3": {s: finetuned_outputs(MODELS / f"dinov3_s{s}", require_folds=False) for s in SEEDS},
+    }
+    point = {
+        "frozen": {part: kcal_mae(frozen, part) for part in ("val", "test")},
+        **{fam: {part: mean_sd([kcal_mae(o, part) for o in outs.values()]) for part in ("val", "test")}
+           for fam, outs in runs.items()},
+    }
+    export_seed = min(SEEDS, key=lambda s: kcal_mae(runs["dinov2"][s], "val"))
+
+    def adaptive_metrics_of(out, difficulty, quantiles):
+        ints = adaptive_intervals(out, difficulty, quantiles, ALPHA)
+        return {ALL_LABELS[v]: {
+            "coverage": coverage(out.kcal["test"], lo, hi),
+            "width_median": float(np.median(hi - lo)),
+            "interval_score": interval_score(out.kcal["test"], lo, hi, ALPHA),
+        } for v, (lo, hi) in ints.items()}
+
+    frozen_variants = adaptive_metrics_of(frozen, frozen_difficulty, frozen_quantiles)
+    per_seed, spearman, resampled = {}, {}, None
+    for s, out in runs["dinov2"].items():
+        difficulty, quantiles = fit_difficulty(out), fit_quantiles(out, ALPHA)
+        per_seed[s] = adaptive_metrics_of(out, difficulty, quantiles)
+        val_res = np.abs(np.log1p(out.kcal["val"]) - out.pred_log["val"])
+        spearman[s] = float(spearmanr(difficulty.sigma(out.emb["val"]), val_res).statistic)
+        if s == export_seed:
+            r = resampled_adaptive_coverage(out, difficulty, quantiles, n_reps=N_REPS, seed=SEED)
+            resampled = {ALL_LABELS[v]: {"mean": float(c.mean()), "sd": float(c.std())} for v, c in r.items()}
+    finetuned_variants = {
+        v: {k: mean_sd([per_seed[s][v][k] for s in SEEDS]) for k in ("coverage", "width_median", "interval_score")}
+        for v in ALL_LABELS.values()
+    }
+    def base_metrics_of(out):
+        ints = conformal_intervals(out.kcal["calib"], out.pred_log["calib"], out.pred_log["test"], ALPHA)
+        return {ALL_LABELS[v]: {
+            "coverage": coverage(out.kcal["test"], lo, hi),
+            "width_median": float(np.median(hi - lo)),
+            "interval_score": interval_score(out.kcal["test"], lo, hi, ALPHA),
+        } for v, (lo, hi) in ints.items()}
+
+    dinov3_per_seed = [base_metrics_of(out) for out in runs["dinov3"].values()]
+    dinov3_variants = {
+        v: {k: mean_sd([m[v][k] for m in dinov3_per_seed]) for k in ("coverage", "width_median", "interval_score")}
+        for v in (ADD, MUL)
+    }
+
+    rows = [
+        {"variant": v, "model": model, "metric": metric, "value": value}
+        for v in ALL_LABELS.values()
+        for model, value_of in (
+            ("Frozen DINOv2 + ridge", lambda m, v=v: frozen_variants[v][m]),
+            ("Fine-tuned DINOv2", lambda m, v=v: finetuned_variants[v][m]["mean"]),
+        )
+        for metric, value in (("Interval score", value_of("interval_score")), ("Median width (kcal)", value_of("width_median")))
+    ]
+    models_scale = alt.Scale(domain=["Frozen DINOv2 + ridge", "Fine-tuned DINOv2"], range=["#A8B0BC", BLUE])
+    bars = lambda metric: alt.Chart(pl.DataFrame(rows).filter(pl.col("metric") == metric)).mark_bar(
+        cornerRadiusTopLeft=2, cornerRadiusTopRight=2, width=alt.RelativeBandSize(0.85)
+    ).encode(
+        x=alt.X("variant:N", sort=list(ALL_LABELS.values()), title=None,
+                axis=alt.Axis(labelAngle=0, labelExpr="split(datum.label, ' ')")),
+        xOffset=alt.XOffset("model:N", sort=models_scale.domain),
+        color=alt.Color("model:N", scale=models_scale, title=None),
+        y=alt.Y("value:Q", title="kcal" if "width" in metric else "Interval score"),
+    ).properties(width=270, height=200, title=metric)
+    save(alt.hconcat(bars("Interval score"), bars("Median width (kcal)"), spacing=30), "finetune_variants")
+
+    return {
+        "search": [{k: v for k, v in r.items() if k != "history"} for r in search],
+        "best_recipe": best,
+        # Learning rates as "3e-5" strings: Typst would print 0.00003.
+        "best_recipe_lr": f"{search[0]['lr']:.0e}".replace("e-0", "e-"),
+        "max_search_lr": f"{max(r['lr'] for r in search):.0e}".replace("e-0", "e-"),
+        "point": point,
+        "export_seed": export_seed,
+        "variants_frozen": frozen_variants,
+        "variants_finetuned": finetuned_variants,
+        "variants_dinov3": dinov3_variants,
+        "spearman_finetuned": {"min": min(spearman.values()), "max": max(spearman.values())},
+        "resampled_export": resampled,
+    }
 
 
 def main() -> None:
@@ -317,14 +441,15 @@ def main() -> None:
     save(alt.hconcat(*panels, spacing=30), "coverage_resampled")
 
     # ------------------------------------------------------ adaptive variants
-    difficulty = fit_difficulty(data, fit, seed=SEED)
-    qfit = fit_quantiles(data, ALPHA)
-    adaptive = {ALL_LABELS[v]: lohi for v, lohi in adaptive_intervals(data, fit, difficulty, qfit, ALPHA).items()}
+    outputs = baseline_outputs(data, fit, seed=SEED)
+    difficulty = fit_difficulty(outputs)
+    qfit = fit_quantiles(outputs, ALPHA)
+    adaptive = {ALL_LABELS[v]: lohi for v, lohi in adaptive_intervals(outputs, difficulty, qfit, ALPHA).items()}
     val_residual = np.abs(np.log1p(y["val"]) - pred_log["val"])
     pred_groups, pred_labels = quantile_groups(pred["test"], n=4)
     n_ingr = np.array([len(dishes[i].ingredients) for i in parts["test"]])
     ingr_groups, ingr_labels = np.digitize(n_ingr, [2, 6, 13]), ["1", "2–5", "6–12", "13+"]
-    adaptive_resampled = resampled_adaptive_coverage(data, fit, difficulty, qfit, n_reps=N_REPS, seed=SEED)
+    adaptive_resampled = resampled_adaptive_coverage(outputs, difficulty, qfit, n_reps=N_REPS, seed=SEED)
 
     def by(groups, names):
         return [
@@ -441,9 +566,10 @@ def main() -> None:
         },
         "examples": examples,
         "adaptive": adaptive_metrics,
+        "finetune": finetune_section(outputs, difficulty, qfit) if (MODELS / "dinov2_s0" / "outputs.npz").exists() else None,
     }
     (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
-    print(json.dumps({k: metrics["adaptive"][k] for k in ("difficulty", "quantiles", "variants", "spread_predicted", "spread_ingredients", "resampled")}, indent=1))
+    print(json.dumps({k: v for k, v in (metrics["finetune"] or {}).items() if k != "search"}, indent=1))
 
 
 if __name__ == "__main__":
