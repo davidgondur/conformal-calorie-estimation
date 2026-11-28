@@ -31,7 +31,6 @@ def _():
 
     return (
         Image,
-        VARIANTS,
         adaptive_intervals,
         alt,
         coverage,
@@ -69,7 +68,6 @@ def _(mo):
 
     Todas se calibran con `calib`. Los modelos nuevos solo leen `train` y `val`.
     """)
-    return
 
 
 @app.cell
@@ -113,7 +111,6 @@ def _(mo):
     lo ha visto. La regularización se elige con `val`. $\hat\sigma$ se recorta por abajo al
     percentil 5 de `train`, para que ningún plato reciba un intervalo casi vacío.
     """)
-    return
 
 
 @app.cell
@@ -142,7 +139,6 @@ def _(difficulty, difficulty_rho, floored_share, mo, pl):
         ],
         align="center",
     )
-    return
 
 
 @app.cell(hide_code=True)
@@ -155,7 +151,6 @@ def _(mo):
     *pinball* en `val`. Como dependen de α, se ajustan una vez para cada α del slider
     (unos segundos por α la primera vez).
     """)
-    return
 
 
 @app.cell
@@ -195,7 +190,6 @@ def _(mo):
     intervalo más $2/\alpha$ por cada kcal que el valor real queda fuera. **Más bajo es
     mejor.**
     """)
-    return
 
 
 @app.cell
@@ -216,7 +210,16 @@ def _(
 
 
 @app.cell
-def _(alpha_slider, coverage, data, interval_score, mo, np, pl, test_intervals):
+def _(
+    alpha_slider,
+    coverage,
+    data,
+    interval_score,
+    mo,
+    np,
+    pl,
+    test_intervals,
+):
     _y = data.kcal["test"]
     summary = pl.DataFrame(
         [
@@ -259,7 +262,6 @@ def _(mo):
       al predecir, pero describe qué platos son difíciles.
     - **kcal reales** (cuartiles): la agrupación del modelo base, para comparar.
     """)
-    return
 
 
 @app.cell
@@ -274,7 +276,16 @@ def _(mo):
 
 
 @app.cell
-def _(coverage_by_group, data, grouping, np, pl, pred_kcal_test, quantile_groups, test_intervals):
+def _(
+    coverage_by_group,
+    data,
+    grouping,
+    np,
+    pl,
+    pred_kcal_test,
+    quantile_groups,
+    test_intervals,
+):
     def group_test_dishes(kind):
         """Group index per test dish and a label per group."""
         if kind == "kcal predichas":
@@ -299,11 +310,20 @@ def _(coverage_by_group, data, grouping, np, pl, pred_kcal_test, quantile_groups
             for _g, _s in coverage_by_group(data.kcal["test"], _lo, _hi, _groups).items()
         ]
     )
-    return by_group, group_names, group_test_dishes
+    return by_group, group_names
 
 
 @app.cell
-def _(VARIANT_COLORS, alpha_slider, alt, by_group, group_names, grouping, mo, pl):
+def _(
+    VARIANT_COLORS,
+    alpha_slider,
+    alt,
+    by_group,
+    group_names,
+    grouping,
+    mo,
+    pl,
+):
     _color = alt.Color(
         "variante:N",
         scale=alt.Scale(domain=list(VARIANT_COLORS), range=list(VARIANT_COLORS.values())),
@@ -337,7 +357,6 @@ def _(VARIANT_COLORS, alpha_slider, alt, by_group, group_names, grouping, mo, pl
     # Static chart: mo.ui.altair_chart would add the same legend selection to
     # both panels, which Vega rejects as a duplicate signal.
     mo.vstack([_cov | _width, mo.md("Diferencia de cobertura entre el mejor y el peor grupo (menor es mejor):"), _spread])
-    return
 
 
 @app.cell(hide_code=True)
@@ -348,7 +367,6 @@ def _(mo):
     Ancho **relativo** (ancho / kcal predichas): con él se ve qué platos considera fáciles
     o difíciles cada variante, sin que domine el tamaño.
     """)
-    return
 
 
 @app.cell
@@ -363,7 +381,17 @@ def _(VARIANT_LABELS, mo):
 
 
 @app.cell
-def _(Image, ROOT, data, example_variant, image_path, mo, np, pred_kcal_test, test_intervals):
+def _(
+    Image,
+    ROOT,
+    data,
+    example_variant,
+    image_path,
+    mo,
+    np,
+    pred_kcal_test,
+    test_intervals,
+):
     _lo, _hi = test_intervals[example_variant.value]
     _rel = (_hi - _lo) / np.maximum(pred_kcal_test, 1)
     _order = np.argsort(_rel)
@@ -391,7 +419,6 @@ def _(Image, ROOT, data, example_variant, image_path, mo, np, pred_kcal_test, te
             mo.hstack([_card(_i) for _i in _order[-4:][::-1]], wrap=True),
         ]
     )
-    return
 
 
 @app.cell(hide_code=True)
@@ -404,7 +431,6 @@ def _(mo):
     **todas** las variantes; la cobertura de la partición oficial es solo una de esas
     repeticiones.
     """)
-    return
 
 
 @app.cell
@@ -495,6 +521,10 @@ def _(
       cobertura media en torno al objetivo; las diferencias en la partición oficial son en parte azar.
     """
     )
+
+
+@app.cell
+def _():
     return
 
 

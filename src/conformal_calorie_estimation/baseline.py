@@ -36,15 +36,10 @@ class BaselineData:
     kcal: dict[str, np.ndarray]  # true calories per part
 
 
-def prepare_baseline(
-    root: Path,
-    features_dir: Path,
-    seed: int = 0,
-    fractions: dict[str, float] = DEFAULT_FRACTIONS,
-    model_name: str = DEFAULT_MODEL,
-    img_size: int = 224,
-) -> BaselineData:
-    """Split the official train set, clean its training part and load embeddings.
+def make_parts(
+    root: Path, seed: int = 0, fractions: dict[str, float] = DEFAULT_FRACTIONS
+) -> tuple[dict[str, Dish], dict[str, list[str]], list[str]]:
+    """Dishes, the project partitions and the training dishes removed by cleaning.
 
     ``test`` is the official test split. ``val`` and ``calib`` come from the
     official train split by incremental groups; only ``train`` is cleaned.
@@ -54,6 +49,20 @@ def prepare_baseline(
     raw = split_by_groups(official["train"], dishes, fractions, seed=seed)
     train = clean_train(raw["train"], dishes)
     parts = {"train": train, **{k: raw[k] for k in fractions}, "test": official["test"]}
+    return dishes, parts, sorted(set(raw["train"]) - set(train))
+
+
+def prepare_baseline(
+    root: Path,
+    features_dir: Path,
+    seed: int = 0,
+    fractions: dict[str, float] = DEFAULT_FRACTIONS,
+    model_name: str = DEFAULT_MODEL,
+    img_size: int = 224,
+) -> BaselineData:
+    """The project partitions (see :func:`make_parts`) with frozen-backbone embeddings."""
+    dishes, parts, removed = make_parts(root, seed, fractions)
+    official = official_splits(root)
     feats = cached_features(
         root, official["train"] + official["test"], features_dir,
         model_name=model_name, img_size=img_size,
@@ -61,7 +70,7 @@ def prepare_baseline(
     return BaselineData(
         dishes=dishes,
         parts=parts,
-        removed=sorted(set(raw["train"]) - set(train)),
+        removed=removed,
         X={k: np.stack([feats[i] for i in ids]) for k, ids in parts.items()},
         kcal={k: np.array([dishes[i].calories for i in ids]) for k, ids in parts.items()},
     )
